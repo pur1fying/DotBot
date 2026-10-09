@@ -31,3 +31,12 @@ tunnel-metadata.json
 *discovery*.json
 *connectivity*.json
 broker-status.json
+
+# Additional private material and mutable callback policy.
+*.pem
+*.key
+secrets/
+private/
+*.outbound.json
+connection.json
+*tunnel*.json

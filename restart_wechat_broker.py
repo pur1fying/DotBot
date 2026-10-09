@@ -12,11 +12,21 @@ import sqlite3
 import stat
 import subprocess
 import time
+import argparse
 from ilink_broker import check_private
 from ilink_ipc import call
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--media', action='store_true', help='Requires approval to stop/restart existing broker and enable media')
+    parser.add_argument('--silk-node', help='Optional absolute Node path for local silk-wasm decoding')
+    args = parser.parse_args()
+    if args.silk_node and not args.media:
+        parser.error('--silk-node requires --media')
+    if args.media:
+        subprocess.run(['/usr/bin/python3', '-I', '-c', 'import cryptography, PIL'],
+                       env={'PATH': '/usr/bin:/bin'}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     base = Path(__file__).resolve().parent
     private = base / 'runtime' / 'wechat-private'
     check_private(private)
@@ -42,6 +52,9 @@ def main():
         if db.execute("SELECT count(*) FROM replies WHERE state='sending'").fetchone()[0]:
             print('{"restart":"refused","reason":"send_in_progress"}')
             return
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tts_generations'").fetchone() and db.execute("SELECT count(*) FROM tts_generations WHERE state='generating'").fetchone()[0]:
+            print('{"restart":"refused","reason":"tts_generation_in_progress"}')
+            return
         # No forced kill: TERM only, hold gate until the exact process exits.
         signal.pidfd_send_signal(pidfd, signal.SIGTERM)
         if not select.select([pidfd], [], [], 5)[0]:
@@ -51,7 +64,10 @@ def main():
         db.rollback()
         db.close()
         os.close(pidfd)
-    subprocess.Popen(['/usr/bin/python3', '-B', str(base / 'ilink_broker.py')], cwd=base,
+    command = ['/usr/bin/python3', '-B', str(base / 'ilink_broker.py')]
+    if args.media: command.append('--media')
+    if args.silk_node: command.extend(['--silk-node', args.silk_node])
+    subprocess.Popen(command, cwd=base,
                      env={'PATH': '/usr/bin:/bin'}, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True, close_fds=True)

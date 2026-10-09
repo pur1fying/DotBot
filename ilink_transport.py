@@ -21,7 +21,7 @@ class ILinkHTTPS:
             raise CallbackError('method_forbidden')
         host, target = destination('https://' + API_HOST + path, {API_HOST})
         allowed = {'/ilink/bot/get_bot_qrcode', '/ilink/bot/get_qrcode_status',
-                   '/ilink/bot/getupdates', '/ilink/bot/sendmessage'}
+                   '/ilink/bot/getupdates', '/ilink/bot/sendmessage', '/ilink/bot/getuploadurl'}
         if target.split('?')[0] not in allowed:
             raise CallbackError('endpoint_forbidden')
         raw = None if body is None else json.dumps(body, ensure_ascii=False).encode()

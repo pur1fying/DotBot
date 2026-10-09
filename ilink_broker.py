@@ -1,6 +1,7 @@
 """Owner-only Unix socket broker. Only this user-started process loads bot token.
 
-No stdout logging, no subprocesses, no credential/context in IPC responses.
+No stdout logging or credential/context in IPC responses. Optional TTS uses a
+fixed local worker with text on stdin and no inherited credential environment.
 The socket is a same-OS-user trust boundary, not a multi-user authorization API.
 """
 import json
@@ -12,9 +13,11 @@ import stat
 import struct
 import threading
 import time
+import argparse
 from ilink_adapter import Binding, TextAdapter, AdapterError, API_HOST
 from ilink_transport import ILinkHTTPS
 from outbound import CallbackError
+from wechat_media import MAX_FRAME, ERROR_CATEGORIES, MediaError, CDNHTTPS
 
 PRIVATE = Path(__file__).parent / 'runtime' / 'wechat-private'
 SOCKET = PRIVATE / 'broker.sock'
@@ -47,10 +50,17 @@ def load_binding(directory):
 
 
 class Broker:
-    def __init__(self, directory, binding, exchange, clock=time.time):
+    def __init__(self, directory, binding, exchange, clock=time.time, *, media_enabled=False, media_transport=None, silk_decoder=None, tts=None):
         self.directory, self.binding, self.clock = directory, binding, clock
         self.lock = threading.Lock()
         self.status = {'bound': True, 'owner_bound': True, 'poll_state': 'starting'}
+        self.media_enabled, self.media_transport, self.silk_decoder = media_enabled, media_transport, silk_decoder
+        self.tts = tts
+        if media_enabled:
+            from local_tts import LocalTTS
+            self.tts = tts if tts is not None else LocalTTS()
+            self.status.update({'media_enabled': True, 'native_voice': False, 'silk_decoder_enabled': silk_decoder is not None,
+                                'local_tts_configured': True})
         def checked_exchange(path, headers, body):
             try:
                 result = exchange(path, headers, body)
@@ -73,8 +83,12 @@ class Broker:
         self.adapter(recover=True).close()
 
     def adapter(self, recover=False):
-        return TextAdapter(self.directory / 'messages.sqlite', self.binding,
-                           test_exchange=self.exchange, clock=self.clock, recover_sending=recover)
+        klass, options = TextAdapter, {}
+        if self.media_enabled:
+            from media_adapter import MediaAdapter
+            klass, options = MediaAdapter, {'media_transport': self.media_transport, 'silk_decoder': self.silk_decoder, 'tts': self.tts}
+        return klass(self.directory / 'messages.sqlite', self.binding,
+                     test_exchange=self.exchange, clock=self.clock, recover_sending=recover, **options)
 
     def call(self, request):
         if not isinstance(request, dict) or set(request) != {'method', 'arguments'} or not isinstance(request['arguments'], dict):
@@ -83,16 +97,22 @@ class Broker:
         if method == 'status' and not args:
             return dict(self.status)
         if method == 'build' and not args:
-            return {'broker_build': 'ack-compat-20260930', 'optional_ret_with_valid_id': True,
-                    'per_reply_diagnostics': True}
-        if method == 'read' and set(args) in (set(), {'after_seq'}):
+            return {'broker_build': 'media-tts-opt-in-20261009', 'optional_ret_with_valid_id': True,
+                    'per_reply_diagnostics': True, 'media_enabled': self.media_enabled, 'native_voice': False}
+        if method == 'read' and set(args) in (set(), {'after_seq'}, {'message_id'}):
             after_seq = args.get('after_seq', 0)
             if type(after_seq) is not int or after_seq < 0:
                 raise AdapterError('invalid_read_cursor')
             with self.lock:
                 adapter = self.adapter()
                 try:
-                    return {'channel_id': CHANNEL, 'messages': adapter.read_messages(after_seq)}
+                    if 'message_id' in args:
+                        if not self.media_enabled or not isinstance(args['message_id'], str) or not 0 < len(args['message_id']) <= 128:
+                            raise AdapterError('invalid_read_message')
+                        messages = adapter.read_messages(message_id=args['message_id'])
+                    else:
+                        messages = adapter.read_messages(after_seq)
+                    return {'channel_id': CHANNEL, 'messages': messages}
                 finally:
                     adapter.close()
         if method == 'reply' and set(args) == {'message_id', 'text', 'idempotency_key'}:
@@ -103,6 +123,21 @@ class Broker:
                     if self.status['poll_state'] == 'session_paused':
                         raise AdapterError('session_paused')
                     return adapter.reply(**args)
+                finally:
+                    adapter.close()
+        fields = {'read_media': ({'message_id', 'media_id'},),
+                  'reply_media': ({'message_id', 'data_base64', 'mime_type', 'idempotency_key', 'delivery_mode'}, {'message_id', 'media_id', 'mime_type', 'idempotency_key', 'delivery_mode'}),
+                  'forget_media': ({'message_id'},), 'stage_media': ({'message_id', 'data_base64', 'mime_type'},),
+                  'generate_audio': ({'message_id', 'text', 'idempotency_key'},)}
+        if self.media_enabled and method in fields and set(args) in fields[method]:
+            if any(not isinstance(v, str) or not v for v in args.values()):
+                raise MediaError('media_too_large_or_invalid')
+            with self.lock:
+                adapter = self.adapter()
+                try:
+                    if method == 'reply_media' and self.status['poll_state'] == 'session_paused':
+                        raise AdapterError('session_paused')
+                    return getattr(adapter, method)(**args)
                 finally:
                     adapter.close()
         raise AdapterError('broker_method_forbidden')
@@ -135,14 +170,15 @@ class Handler(socketserver.StreamRequestHandler):
         if uid != os.getuid():
             return
         try:
-            line = self.rfile.readline(32769)
-            if len(line) > 32768 or not line.endswith(b'\n'):
+            line = self.rfile.readline(MAX_FRAME + 1)
+            if len(line) > MAX_FRAME or not line.endswith(b'\n'):
                 raise AdapterError('request_too_large')
             result = self.server.broker.call(json.loads(line))
             output = {'ok': True, 'result': result}
-        except Exception:
+        except Exception as e:
             # Never serialize request, server response, exception or traceback.
-            output = {'ok': False, 'error': 'broker_operation_rejected'}
+            category = str(e) if isinstance(e, MediaError) and str(e) in ERROR_CATEGORIES else 'broker_operation_rejected'
+            output = {'ok': False, 'error': category}
         self.wfile.write(json.dumps(output, ensure_ascii=False).encode() + b'\n')
 
 
@@ -153,6 +189,12 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--media', action='store_true', help='Requires approval to restart broker and enable Tencent CDN media I/O')
+    parser.add_argument('--silk-node', help='Absolute Node executable for optional local silk-wasm decoder; no STT/TTS')
+    args = parser.parse_args()
+    if args.silk_node and not args.media:
+        parser.error('--silk-node requires --media')
     os.umask(0o077)
     # Atomic single instance via flock; no inspection of another process/env.
     import fcntl
@@ -160,7 +202,12 @@ def main():
     lockfd = os.open(PRIVATE / 'broker.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     binding = load_binding(PRIVATE)
-    broker = Broker(PRIVATE, binding, ILinkHTTPS().exchange)
+    decoder = None
+    if args.silk_node:
+        from silk_decoder import SilkDecoder
+        decoder = SilkDecoder(args.silk_node)
+    broker = Broker(PRIVATE, binding, ILinkHTTPS().exchange,
+                    media_enabled=args.media, media_transport=CDNHTTPS(enabled=True) if args.media else None, silk_decoder=decoder)
     SOCKET.unlink(missing_ok=True)
     server = Server(str(SOCKET), Handler)
     os.chmod(SOCKET, 0o600)

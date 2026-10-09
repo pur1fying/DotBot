@@ -1,0 +1,2 @@
+-r requirements-media.txt
+jsonschema==4.25.0
