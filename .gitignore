@@ -1,0 +1,33 @@
+# Runtime and credentials never belong in Git.
+runtime/
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+**/binding.json
+*.sqlite*
+*.db*
+*.log
+*.jsonl
+*-test-results.txt
+.validation/
+.worktrees/
+clash-change/
+*.patch
+# Private/generated media and host-specific connection snapshots.
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.wav
+*.silk
+*.mp3
+*.mp4
+tunnel-metadata.json
+*discovery*.json
+*connectivity*.json
+broker-status.json
