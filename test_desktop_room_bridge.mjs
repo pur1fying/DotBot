@@ -32,7 +32,8 @@ function fixture(options = {}) {
       async upload(roomId, file) { uploads.push({roomId, name: file.name, mime: file.type});
         return {fileId: 'uploaded-file', mime: file.type, status: 'UPLOADED'}; },
       async image(...args) { downloads.push(args);
-        return {image: new Blob([Buffer.from('89504e470d0a1a0a', 'hex')], {type: 'image/png'})}; }
+        return {image: new Blob([Buffer.from('89504e470d0a1a0a', 'hex')], {type: 'image/png'}),
+          attachment: {sizeBytes: 8, downloadUrl: 'private-signed-media'}, width: 4, height: 3}; }
     }, subscribeSendIntegrity() { return () => {stopped++;}; }};
   }};
   return {shared, native, state, sends, uploads, downloads, get stopped() {return stopped;},
@@ -112,6 +113,10 @@ test('image download verifies the dot author and opaque attachment; no signed UR
   assert.equal(JSON.stringify(projected).includes('private-signed-media'), false);
   const result = await bridge.invoke('download_image', {message_id: 'message', attachment_id: 'image', parent_id: 'parent'});
   assert.equal(result.value.mime_type, 'image/png'); assert.equal(f.downloads.length, 1);
+  assert.equal(result.value.source_type, 'file'); assert.equal(result.value.source_file_id, 'file');
+  assert.equal(result.value.declared_size_bytes, 8);
+  assert.deepEqual([result.value.width, result.value.height], [4, 3]);
+  assert.equal(JSON.stringify(result).includes('private-signed-media'), false);
   assert.equal((await bridge.invoke('download_image', {message_id: 'foreign', attachment_id: 'image', parent_id: 'parent'})).error,
     'dot_image_message_unavailable');
   assert.equal(f.downloads.length, 1); bridge.dispose();

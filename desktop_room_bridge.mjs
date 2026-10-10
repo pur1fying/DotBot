@@ -217,7 +217,10 @@ export async function createDesktopRoomBridge(shared, native, binding) {
         for (let offset = 0; offset < bytes.length; offset += 32768)
           binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
         return {ok: true, value: {data_base64: btoa(binary), mime_type: result.image.type || attachment.mime,
-          size_bytes: bytes.length}};
+          size_bytes: bytes.length, source_type: attachment.type,
+          source_file_id: attachment.fileId || null,
+          declared_size_bytes: result.attachment?.sizeBytes ?? null,
+          width: result.width ?? null, height: result.height ?? null}};
       }
       if (operation === 'wait') {
         if (waiter) throw new Error('desktop_wait_already_active');

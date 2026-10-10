@@ -63,6 +63,14 @@
 
 本轮仅实现并验证图片文件**入站**。爱丽丝图片输出仍走微信图片消息，不能据此宣称原文件下行回传无损。私有记录：`image-file-enablement.json`、`latest-image-file-recovery.json`、`wechat-image-file-e2e-test.json`。
 
+## dot 原图回传测试（2026-10-10）
+
+用户在微信发送“将这张图原图发给我”（local_seq=55）。原生回传 PNG、微信 API 接受一次，但原图回传判定 **未通过**：输入文件为 2,115,564 字节、1206×2622；回传为 2,151,334 字节、942×2048，文件 bytes 与解码像素均不同。PNG 文件大小增加不代表原图质量或原文件得到保留。
+
+再次通过原生客户端读取同一输出附件，实际附件类型为 `file`，文件元数据给出的宽高也是 942×2048；取回 bytes 与 broker 已发送的暂存 bytes 完全一致。使用了原生文件下载分支，未误走 media thumbnail 分支。回传 file_id 与上传的原始 file_id 不同；可定位为原生附件链路已返回变更后的图，不能进一步断言具体内部处理步骤。网关没有缩放或重新编码该回图。
+
+私有报告：`wechat-original-return-e2e-test.json`、`original-return-native-metadata.json`。手机实收尚未单独确认，完整原文件回传仍未验证。桥接增加了只含类型、opaque 文件 ID、大小和宽高的下载诊断元数据；8 项 Node 检查通过，无签名 URL 导出。
+
 本机私有记录位于独立运行目录的 `image-gateway-enablement.json`、`native-image-capability-probe.json`、`native-image-return-probe.json`、`wechat-image-e2e-test.json`，图片、绑定、实际 ID、缓存和数据库不进入 Git。
 
 ## 启用方式
