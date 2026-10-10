@@ -73,7 +73,7 @@ class DesktopRoomClient:
                                self.port, self.target_id)
         try:
             self.socket = await connect(target['webSocketDebuggerUrl'], proxy=None,
-                                        open_timeout=3, max_size=2**22)
+                                        open_timeout=3, max_size=8 * 1024 * 1024)
             self.reader = asyncio.create_task(self._read())
             source = Path(__file__).with_name('desktop_room_bridge.mjs').read_text()
             source = source.replace('export async function ', 'async function ', 1)
@@ -136,7 +136,7 @@ class DesktopRoomClient:
             self.pending.pop(request_id, None)
 
     async def invoke(self, operation, arguments=None):
-        if operation not in ('status', 'messages', 'send', 'wait'):
+        if operation not in ('status', 'messages', 'send', 'wait', 'upload_image', 'download_image'):
             raise DotError('desktop_operation_not_allowed')
         if self.object_id is None:
             raise DotError('desktop_bridge_closed')
@@ -145,7 +145,7 @@ class DesktopRoomClient:
                 'objectId': self.object_id,
                 'functionDeclaration': 'function(op, args) { return this.invoke(op, args); }',
                 'arguments': [{'value': operation}, {'value': arguments or {}}],
-                'awaitPromise': True, 'returnByValue': True}, timeout=60 if operation == 'send' else 35)
+                'awaitPromise': True, 'returnByValue': True}, timeout=60 if operation in ('send', 'upload_image', 'download_image') else 35)
             if result.get('exceptionDetails'):
                 raise DotError('desktop_room_request_failed')
             response = result.get('result', {}).get('value', {})
@@ -163,6 +163,9 @@ class DesktopRoomClient:
             if operation == 'send' and (not isinstance(error, DotError) or error.category in (
                     'desktop_request_timeout', 'desktop_disconnected', 'desktop_rpc_failed')):
                 raise DotError('dot_submission_unknown') from None
+            if operation == 'upload_image' and (not isinstance(error, DotError) or error.category in (
+                    'desktop_request_timeout', 'desktop_disconnected', 'desktop_rpc_failed')):
+                raise DotError('dot_image_upload_unknown') from None
             raise
 
     async def close(self):

@@ -51,12 +51,14 @@ def load_binding(directory):
 
 
 class Broker:
-    def __init__(self, directory, binding, exchange, clock=time.time, *, media_enabled=False, media_transport=None, silk_decoder=None, tts=None):
+    def __init__(self, directory, binding, exchange, clock=time.time, *, media_enabled=False,
+                 images_enabled=False, media_transport=None, silk_decoder=None, tts=None):
         self.directory, self.binding, self.clock = directory, binding, clock
         self.lock = threading.Lock()
         self.changed = threading.Condition()
         self.status = {'bound': True, 'owner_bound': True, 'poll_state': 'starting'}
         self.media_enabled, self.media_transport, self.silk_decoder = media_enabled, media_transport, silk_decoder
+        self.images_enabled = images_enabled
         self.tts = tts
         if media_enabled:
             from local_tts import LocalTTS
@@ -86,9 +88,10 @@ class Broker:
 
     def adapter(self, recover=False):
         klass, options = TextAdapter, {}
-        if self.media_enabled:
+        if self.media_enabled or self.images_enabled:
             from media_adapter import MediaAdapter
-            klass, options = MediaAdapter, {'media_transport': self.media_transport, 'silk_decoder': self.silk_decoder, 'tts': self.tts}
+            klass, options = MediaAdapter, {'media_transport': self.media_transport, 'silk_decoder': self.silk_decoder,
+                'tts': self.tts, 'images_only': not self.media_enabled, 'direct_images': self.images_enabled}
         return klass(self.directory / 'messages.sqlite', self.binding,
                      test_exchange=self.exchange, clock=self.clock, recover_sending=recover, **options)
 
@@ -100,7 +103,8 @@ class Broker:
             return dict(self.status)
         if method == 'build' and not args:
             return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
-                    'per_reply_diagnostics': True, 'media_enabled': self.media_enabled, 'native_voice': False}
+                    'per_reply_diagnostics': True, 'media_enabled': self.media_enabled,
+                    'images_enabled': self.images_enabled, 'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
             if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
                 raise AdapterError('invalid_wait_arguments')
@@ -205,6 +209,9 @@ class Broker:
             'dot_submitted': ({'message_id', 'turn_id', 'written_at', 'error'}, store.submitted),
             'dot_mark': ({'message_id', 'state', 'category'}, store.mark),
             'dot_unsent': ({'message_id'}, store.unsent),
+            'dot_input_image_begin': ({'message_id', 'media_id'}, store.input_image_begin),
+            'dot_input_image_done': ({'message_id', 'media_id', 'file_id'}, store.input_image_done),
+            'dot_output_next': (set(), store.next_part),
             'dot_room_message': ({'message'}, store.room_message),
             'dot_room_reconcile': (set(), store.reconcile_room_inbox),
             'dot_room_cursor': (set(), store.room_cursor),
@@ -216,15 +223,35 @@ class Broker:
             if set(args) != fields:
                 raise DotError('dot_invalid_arguments')
             return operation(**args)
+        if method == 'dot_read_image' and set(args) == {'message_id', 'media_id'}:
+            if not self.images_enabled or not store.job(args['message_id']):
+                raise DotError('dot_image_disabled_or_unknown')
+            row = adapter.db.execute('SELECT kind FROM media WHERE id=? AND message_id=?',
+                                     (args['media_id'], args['message_id'])).fetchone()
+            if row != ('image',):
+                raise DotError('dot_invalid_image_query')
+            return adapter.read_media(**args)
+        if method == 'dot_stage_output_image' and set(args) == {'item_id', 'data_base64'}:
+            part = store.next_part()
+            if not self.images_enabled or not part or part['kind'] != 'image' or part['item_id'] != args['item_id']:
+                raise DotError('dot_invalid_image_output')
+            from wechat_media import decode_base64, validate_media
+            meta = validate_media(decode_base64(args['data_base64']), 'image')
+            staged = adapter.stage_media(part['message_id'], args['data_base64'], meta['mime_type'])
+            return store.output_image_ready(part['item_id'], staged['media_id'], meta['mime_type'])
         if method == 'dot_drain_one' and not args:
             if self.status['poll_state'] == 'session_paused':
                 raise DotError('wechat_session_paused')
             part = store.next_part()
-            if part is None:
+            if part is None or part['state'] != 'ready':
                 return None
             store.begin_part(part['item_id'], part['part'])
             try:
-                result = adapter.reply(part['message_id'], part['text'], part['idempotency_key'], _route='direct')
+                if part['kind'] == 'image':
+                    result = adapter.reply_media(part['message_id'], part['mime_type'], part['idempotency_key'],
+                        'image', media_id=part['media_id'], _route='direct')
+                else:
+                    result = adapter.reply(part['message_id'], part['text'], part['idempotency_key'], _route='direct')
                 state = result['state']
             except Exception:
                 state = 'unknown'
@@ -287,7 +314,8 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--media', action='store_true', help='Requires approval to restart broker and enable Tencent CDN media I/O')
+    parser.add_argument('--media', action='store_true', help='Enable the full media tools and Tencent CDN I/O')
+    parser.add_argument('--images', action='store_true', help='Enable image-only native direct routing and Tencent CDN I/O')
     parser.add_argument('--silk-node', help='Absolute Node executable for optional local silk-wasm decoder; no STT/TTS')
     args = parser.parse_args()
     if args.silk_node and not args.media:
@@ -304,7 +332,8 @@ def main():
         from silk_decoder import SilkDecoder
         decoder = SilkDecoder(args.silk_node)
     broker = Broker(PRIVATE, binding, ILinkHTTPS().exchange,
-                    media_enabled=args.media, media_transport=CDNHTTPS(enabled=True) if args.media else None, silk_decoder=decoder)
+                    media_enabled=args.media, images_enabled=args.images,
+                    media_transport=CDNHTTPS(enabled=True) if args.media or args.images else None, silk_decoder=decoder)
     SOCKET.unlink(missing_ok=True)
     server = Server(str(SOCKET), Handler)
     os.chmod(SOCKET, 0o600)

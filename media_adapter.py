@@ -18,8 +18,10 @@ from urllib.parse import urlencode
 
 
 class MediaAdapter(TextAdapter):
-    def __init__(self, *args, media_transport=None, silk_decoder=None, tts=None, **kwargs):
+    def __init__(self, *args, media_transport=None, silk_decoder=None, tts=None,
+                 images_only=False, direct_images=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.images_only, self.direct_images = images_only, direct_images
         self.media_transport, self.silk_decoder = media_transport, silk_decoder
         self.tts = tts
         self.db.executescript('''
@@ -45,6 +47,8 @@ class MediaAdapter(TextAdapter):
                 if not isinstance(item, dict):
                     return None
                 kind = item.get('type')
+                if self.images_only and kind not in (1, 2):
+                    return None
                 if kind == 1:
                     value = item.get('text_item', {}).get('text')
                     if not isinstance(value, str):
@@ -113,7 +117,8 @@ class MediaAdapter(TextAdapter):
                     continue
                 received = self.clock()
                 self.db.execute('INSERT INTO messages VALUES (?,?,?,?,?)', (mid, text, context, received, digest))
-                self.dot.record_incoming(mid, received, force_webhook=bool(refs))
+                direct = self.direct_images and refs and all(kind == 'image' for _, kind, _ in refs)
+                self.dot.record_incoming(mid, received, force_webhook=bool(refs) and not direct)
                 for index, kind, ref in refs:
                     aid = 'media_' + hashlib.sha256((mid + ':' + str(index)).encode()).hexdigest()
                     self.db.execute('INSERT INTO media VALUES (?,?,?,?,?,?,?,?)',
@@ -135,6 +140,10 @@ class MediaAdapter(TextAdapter):
     def read_page(self, after_seq=0, limit=20, message_id=None, *, pending_only=False):
         self.prune()
         page = super().read_page(after_seq, limit, message_id, pending_only=pending_only)
+        # Image direct routing uses private dot_* IPC. Keep the original public
+        # eight-tool MCP contract until full media tools are explicitly enabled.
+        if self.images_only:
+            return page
         for msg in page['messages']:
             msg['attachments'] = []
             for aid, kind, state, metadata in self.db.execute('SELECT id,kind,state,metadata FROM media WHERE message_id=? ORDER BY rowid', (msg['message_id'],)):
@@ -267,7 +276,9 @@ class MediaAdapter(TextAdapter):
                 'duration_ms': meta['duration_ms'], 'sample_rate_hz': rate,
                 'size_bytes': len(raw), 'sha256': meta['sha256']}
 
-    def reply_media(self, message_id, mime_type, idempotency_key, delivery_mode, data_base64=None, media_id=None):
+    def reply_media(self, message_id, mime_type, idempotency_key, delivery_mode, data_base64=None, media_id=None, *, _route='webhook'):
+        if self.dot.route(message_id) != _route:
+            raise AdapterError('message_route_mismatch')
         if delivery_mode not in ('image', 'audio_attachment'):
             raise MediaError('native_voice_not_verified')
         kind = 'image' if delivery_mode == 'image' else 'audio'

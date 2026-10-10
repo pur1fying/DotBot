@@ -1,6 +1,6 @@
 # 微信媒体与本地 TTS 接口
 
-媒体为 opt-in。broker `--media` 与 MCP `--wechat-owner --wechat-media` 同时启用才构成完整能力；在线启用须先确认。保留原本人绑定、同一 dot、原事件 `wechat.message.created` 与订阅。工具输入中的 ID 必须来自真实新消息/返回结果，不能猜编号或重发历史消息。
+图片直连使用 broker `--images`，保持原 8 个 MCP 工具、原生爱丽丝房间和直连回复父链，详见 [图片直连](IMAGE_DIRECT.md)。以下为另一套显式媒体工具模式：broker `--media` 与 MCP `--wechat-owner --wechat-media` 同时启用才构成完整能力；在线启用须先确认。保留原本人绑定、同一 dot、原事件 `wechat.message.created` 与订阅。工具输入中的 ID 必须来自真实新消息/返回结果，不能猜编号或重发历史消息。
 
 | 工具 | 输入 | 结果 |
 |---|---|---|
@@ -21,7 +21,7 @@ python3 -B stage_wechat_media.py \
   --message-id '<实际新来信 ID>' --file '<选定的图片/WAV>' --mime-type audio/wav
 ```
 
-此入口只读取选定 regular file，不跟随最终 symlink，最多 4 MiB。`stage_media` 仅向同 OS 用户的 0600 Unix socket 开放，不是远端任意文件读取工具。云端 dot 图像生成产物 → 本机暂存/真实 bytes 的自动搬运尚未验证，项目也不提供任意 URL 下载端点。
+此入口只读取选定 regular file，不跟随最终 symlink，最多 4 MiB。`stage_media` 仅向同 OS 用户的 0600 Unix socket 开放，不是远端任意文件读取工具。图片直连可从经身份与父链核对的原生房间图片附件自动取到 bytes，并暂存到对应来信下；不提供任意 URL 下载端点。
 
 本地 TTS 流程为 `wechat_generate_audio` → 实际 `out_...` ID → **另一次** `wechat_reply_media`（`audio_attachment`）。TTS 固定 eSpeak NG `cmn` 普通话，不自定义声音、不用云端服务/新 key/收费 API；输出为机械合成音，尚未做听感验收，不声称爱丽丝专属音色或音色克隆。最多 300 Unicode 字符、1200 UTF-8 字节；拒绝空白/控制字符/NUL/非法 Unicode；20 秒子进程超时，PCM 16-bit mono、8–48 kHz、最长 60 秒/4 MiB。SSML、phoneme、播放、任意命令/URL/文件参数均未开放。
 

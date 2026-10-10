@@ -65,7 +65,7 @@ python -B dot_gateway.py rollback
 
 `bind` 需要已验证的 `desktop_room_reply_v1` 私有报告，并再次读取实际房间。`preflight-desktop` 仅检查读路径，其本身不授予生产启用资格。
 
-`canary` 只将 `【DotBot直连测试】` 开头的纯文字归直连，其余保持 webhook。`activate` 将切换序号之后的纯文字归直连；图片和语音继续原路径。切换要求网关健康、协议已验证、旧链路待回复及发送完成。
+`canary` 只领取 `【DotBot直连测试】` 开头的消息。`activate` 将新文字归直连；broker `--images` 还会将图片归直连。音频保持未启用。图片开关无需扩展 MCP 工具契约，详见 [图片直连](IMAGE_DIRECT.md)。切换要求网关健康、协议已验证、旧链路待回复及发送完成。
 
 `rollback` 停止新领取，仅明确未提交的 queued 消息可归回 webhook。已经提交或结果不明的消息保留直连归属。broker 与 MCP 有持久回滚补投/确认机制，转发游标已经越过的未提交消息也不会遗漏。
 
@@ -92,3 +92,5 @@ node --test test_desktop_room_bridge.mjs
 正式 A/B 初测第 4 条暴露了来源标签筛选过严的问题：爱丽丝已生成 `persistent_mode` 答复，网关误过滤并推进了游标。已取消来源枚举限制，仍保留身份/房间/对外角色/父链检查；重启与 reconcile 从最早未完成的自有输入回填，支持恢复已越过全局游标的答复。原始异常数据保留，修复后的新链路另起完整测试组。
 
 最终回归 169 项 Python、6 项 Node 通过。新链路以修复后的 10 条重新验证，入库到 native send 的样本 P95 为 119.3 ms，完整答复入队到微信发送开始为 43.5 ms。当前模式为 direct，普通新文字无需测试前缀。
+
+2026-10-10 图片扩展：broker 已使用 `--images`，在原生房间内上传/读取 PNG、JPEG、静态 WebP；输入文件 ID 持久复用，输出附件独立排队，处理无文字图片答复和延迟出现的附件。普通检查 177 项 Python、8 项 Node 通过。实测与手机验收状态见 [图片直连](IMAGE_DIRECT.md)。

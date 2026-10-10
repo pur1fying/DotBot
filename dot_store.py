@@ -15,7 +15,7 @@ CANARY_PREFIX = '【DotBot直连测试】'
 
 
 def initialize(db):
-    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('2',):
+    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('3',):
         return
     db.executescript('''
       CREATE TABLE IF NOT EXISTS bridge_routes (
@@ -43,16 +43,24 @@ def initialize(db):
         received_at REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS dot_room_inbox (
         room_message_id TEXT PRIMARY KEY, payload TEXT NOT NULL, received_at REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS dot_input_images (
+        message_id TEXT NOT NULL, media_id TEXT NOT NULL, state TEXT NOT NULL,
+        file_id TEXT, PRIMARY KEY (message_id,media_id));
     ''')
     columns = {row[1] for row in db.execute('PRAGMA table_info(dot_jobs)')}
     for name, sql_type in (('room_message_id', 'TEXT'), ('relay_replayed', 'INTEGER NOT NULL DEFAULT 0')):
         if name not in columns:
             db.execute(f'ALTER TABLE dot_jobs ADD COLUMN {name} {sql_type}')
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS dot_jobs_room_message ON dot_jobs(room_message_id)')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(dot_outbox)')}
+    for name, sql_type in (('kind', "TEXT NOT NULL DEFAULT 'text'"), ('media_id', 'TEXT'),
+                           ('mime_type', 'TEXT'), ('attachment_id', 'TEXT'), ('parent_id', 'TEXT')):
+        if name not in columns:
+            db.execute(f'ALTER TABLE dot_outbox ADD COLUMN {name} {sql_type}')
     # Existing messages stay on their original route; activating never replays history.
     with db:
         db.execute("INSERT OR IGNORE INTO bridge_routes SELECT id,'webhook',received FROM messages")
-        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','2')")
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','3')")
 
 
 def split_text(text, limit=2000):
@@ -186,6 +194,8 @@ class DotStore:
 
     def recover(self):
         with self.db:
+            self.db.execute("UPDATE dot_jobs SET state='requires_user_action',error_category='dot_image_upload_unknown' WHERE message_id IN (SELECT message_id FROM dot_input_images WHERE state='uploading') AND state='queued'")
+            self.db.execute("UPDATE dot_input_images SET state='unknown' WHERE state='uploading'")
             self.db.execute("UPDATE dot_jobs SET state='submission_unknown' WHERE state='submitting'")
             self.db.execute("UPDATE dot_jobs SET state='send_unknown' WHERE message_id IN (SELECT message_id FROM dot_outbox WHERE state='sending')")
             self.db.execute("UPDATE dot_outbox SET state='unknown' WHERE state='sending'")
@@ -194,13 +204,44 @@ class DotStore:
         with self.db:
             self.db.execute("UPDATE dot_jobs SET state='expired',error_category='reply_window_expired' WHERE state NOT IN ('expired','rolled_back') AND received_at<?",
                             (self.now() - REPLY_WINDOW,))
-            self.db.execute("UPDATE dot_outbox SET state='expired' WHERE state='ready' AND message_id IN (SELECT message_id FROM dot_jobs WHERE state='expired')")
+            self.db.execute("UPDATE dot_outbox SET state='expired' WHERE state IN ('ready','awaiting_media') AND message_id IN (SELECT message_id FROM dot_jobs WHERE state='expired')")
 
     def job(self, message_id):
         cursor = self.db.execute('''SELECT j.*,m.text FROM dot_jobs j
           JOIN messages m ON m.id=j.message_id WHERE j.message_id=?''', (message_id,))
         row = cursor.fetchone()
-        return dict(zip([column[0] for column in cursor.description], row)) if row else None
+        if not row:
+            return None
+        job = dict(zip([column[0] for column in cursor.description], row))
+        job['images'] = []
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media'").fetchone():
+            job['images'] = [dict(zip(('media_id', 'state', 'file_id'), values)) for values in
+                self.db.execute('''SELECT m.id,COALESCE(i.state,'pending'),i.file_id FROM media m
+                  LEFT JOIN dot_input_images i ON i.media_id=m.id AND i.message_id=m.message_id
+                  WHERE m.message_id=? AND m.kind='image' ORDER BY m.rowid''', (message_id,))]
+        return job
+
+    def input_image_begin(self, message_id, media_id):
+        job = self.job(message_id)
+        if not job or job['state'] != 'queued' or not any(image['media_id'] == media_id for image in job['images']):
+            raise DotError('dot_invalid_image_upload')
+        with self.db:
+            if self.db.execute('SELECT 1 FROM dot_input_images WHERE message_id=? AND media_id=?', (message_id, media_id)).fetchone():
+                raise DotError('dot_image_upload_already_attempted')
+            self.db.execute("INSERT INTO dot_input_images VALUES (?,?,'uploading',NULL)", (message_id, media_id))
+
+    def input_image_done(self, message_id, media_id, file_id):
+        if file_id is not None and (not isinstance(file_id, str) or not file_id or len(file_id) > 256):
+            raise DotError('dot_invalid_image_file_id')
+        with self.db:
+            result = self.db.execute("UPDATE dot_input_images SET state=?,file_id=? WHERE message_id=? AND media_id=? AND state='uploading'",
+                ('ready' if file_id else 'unknown', file_id, message_id, media_id))
+            if result.rowcount != 1:
+                raise DotError('dot_image_upload_not_pending')
+            if file_id:
+                self.metric(message_id, 'image_uploaded')
+            else:
+                self.mark(message_id, 'requires_user_action', 'dot_image_upload_unknown')
 
     def next_job(self):
         self.expire()
@@ -311,6 +352,40 @@ class DotStore:
             if result.rowcount != 1:
                 raise DotError('dot_submission_not_proven_unsent')
 
+    def _enqueue_images(self, message_id, message):
+        images = message.get('images') or []
+        if not isinstance(images, list) or len(images) > 8:
+            raise DotError('dot_invalid_image_output')
+        added = 0
+        with self.db:
+            for image in images:
+                aid = image.get('attachment_id') if isinstance(image, dict) else None
+                if not isinstance(aid, str) or not aid or len(aid) > 256:
+                    raise DotError('dot_invalid_image_output')
+                suffix = hashlib.sha256((message['id'] + '\0' + aid).encode()).hexdigest()
+                iid = 'image_' + suffix
+                if self.db.execute('SELECT 1 FROM dot_items WHERE item_id=?', (iid,)).fetchone():
+                    continue
+                self.db.execute('INSERT INTO dot_items VALUES (?,?,?,?)', (iid, message_id, suffix, self.now()))
+                self.db.execute('''INSERT INTO dot_outbox
+                  (item_id,message_id,part,text,idempotency_key,state,kind,attachment_id,parent_id)
+                  VALUES (?,?,0,'',?,'awaiting_media','image',?,?)''',
+                  (iid, message_id, message_id + '-dot-image-' + suffix[:24], aid,
+                   json.dumps({'message_id': message['id'], 'parent_id': message.get('replyToMessageId')})))
+                added += 1
+            if added:
+                self.db.execute("UPDATE dot_jobs SET state=CASE WHEN state NOT IN ('send_unknown','sending','failed') THEN 'reply_ready' ELSE state END,first_reply_at=COALESCE(first_reply_at,?) WHERE message_id=?", (self.now(), message_id))
+                self.metric(message_id, 'reply_complete')
+        return added
+
+    def output_image_ready(self, item_id, media_id, mime_type):
+        with self.db:
+            changed = self.db.execute("UPDATE dot_outbox SET media_id=?,mime_type=?,state='ready' WHERE item_id=? AND kind='image' AND state='awaiting_media'",
+                                     (media_id, mime_type, item_id))
+            if changed.rowcount != 1:
+                raise DotError('dot_image_output_not_pending')
+        return {'ready': True}
+
     def room_message(self, message):
         binding = self.binding or {}
         if (binding.get('transport') != 'desktop_native_room' or not isinstance(message, dict) or
@@ -349,9 +424,12 @@ class DotStore:
         if not job or job['state'] in ('queued', 'expired', 'rolled_back') or self.now() - job['received_at'] > REPLY_WINDOW:
             return {'accepted': False, 'category': 'reply_window_expired'}
         text = visible_text(message)
-        if not text.strip():
+        if not text.strip() and not message.get('images'):
             text = '爱丽丝发来需要确认的请求，请打开 Codex 查看并处理。'
         result = self._enqueue(row[0], iid, text)
+        images_added = self._enqueue_images(row[0], message)
+        if images_added:
+            result = {'accepted': True, 'message_id': row[0], 'images': images_added}
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO dot_room_messages VALUES (?,?,?,?)',
                             (iid, row[0], parent, self.now()))
@@ -388,7 +466,7 @@ class DotStore:
     def next_part(self):
         self.expire()
         cursor = self.db.execute('''SELECT o.* FROM dot_outbox o JOIN dot_jobs j USING(message_id)
-          WHERE o.state='ready' AND j.state NOT IN ('expired','send_unknown','failed','rolled_back')
+          WHERE o.state IN ('ready','awaiting_media') AND j.state NOT IN ('expired','send_unknown','failed','rolled_back')
           ORDER BY j.received_at,o.rowid LIMIT 1''')
         row = cursor.fetchone()
         return dict(zip([column[0] for column in cursor.description], row)) if row else None

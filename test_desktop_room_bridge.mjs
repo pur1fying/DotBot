@@ -3,16 +3,19 @@ import assert from 'node:assert/strict';
 import {createDesktopRoomBridge} from './desktop_room_bridge.mjs';
 
 const binding = {account_id: 'account', user_id: 'user', dot_id: 'dot',
-  thread_id: 'thread', messaging_room_id: 'room'};
+  thread_id: 'thread', messaging_room_id: 'room', reply_anchor_message_id: 'anchor'};
 const requestId = '00000000-0000-4000-8000-000000000001';
 function fixture(options = {}) {
   const state = {ready: true, account: 'account', user: 'user',
     structure: {status: 'loaded', structure: 'personal'}};
   let watch, observer, configuration, stopped = 0;
-  const sends = [];
+  const sends = [], uploads = [], downloads = [];
   const msg = {id: 'message', roomId: 'room', role: 'user', self: true,
     requestId, text: '完整文字', attachments: [{url: 'private-signed-media'}],
     messageMetadata: {secret: 'not-exported'}};
+  if (options.imageReply) Object.assign(msg, {self: false, senderAeonId: 'dot',
+    replyRootMessageId: 'anchor', attachments: [{type: 'file', attachmentId: 'image',
+      fileId: 'file', mime: 'image/png', url: 'private-signed-media'}]});
   const scope = {get: key => state[key], watch: fn => { watch = fn; return () => { stopped++; }; }};
   const shared = {Agt() {}, NOt: 'ready', AOt: 'account', FOt: 'user', kOt: 'structure', MOt: 'accountUser',
     ZKt: {scope}, kgt: () => ({subscribe(handler) {observer = handler; return () => {stopped++;};}})};
@@ -25,9 +28,14 @@ function fixture(options = {}) {
       async send(args) { sends.push(args); config.beforeSend(); if (options.unknown)
         throw Object.assign(new Error('must not be exposed'), {deliveryUnknown: true});
         return {...msg, ...args}; }
+    }, media: {
+      async upload(roomId, file) { uploads.push({roomId, name: file.name, mime: file.type});
+        return {fileId: 'uploaded-file', mime: file.type, status: 'UPLOADED'}; },
+      async image(...args) { downloads.push(args);
+        return {image: new Blob([Buffer.from('89504e470d0a1a0a', 'hex')], {type: 'image/png'})}; }
     }, subscribeSendIntegrity() { return () => {stopped++;}; }};
   }};
-  return {shared, native, state, sends, get stopped() {return stopped;},
+  return {shared, native, state, sends, uploads, downloads, get stopped() {return stopped;},
     notify: data => observer.onUpdate(data), receive: (id, data) => observer.onMessageReceived(id, data),
     changeAccount() {state.account = 'another'; watch();}, get configuration() {return configuration;}};
 }
@@ -76,10 +84,35 @@ test('only the pinned room wakes the receiver; overflow requires history resync'
   events = (await bridge.invoke('wait')).value;
   assert.equal(events[0].type, 'resync'); assert.ok(events.length <= 256); bridge.dispose();
 });
-test('cannot use the bridge as generic HTTP, room creation or attachment sender', async () => {
+test('cannot use the bridge as generic HTTP or room creation', async () => {
   const f = fixture(); const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
   assert.equal((await bridge.invoke('httpFetch')).error, 'desktop_operation_not_allowed');
   assert.equal((await bridge.invoke('send', {requestId, text: 'x', roomId: 'other'})).error, 'dot_invalid_submission');
   assert.equal((await bridge.invoke('messages', {limit: 101})).error, 'dot_invalid_message_query');
   assert.equal(f.sends.length, 0); bridge.dispose();
+});
+test('image upload uses the native media client in the pinned room and rejects other file kinds', async () => {
+  const f = fixture(); const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
+  const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+  const uploaded = await bridge.invoke('upload_image', {data_base64: png, mime_type: 'image/png'});
+  assert.equal(uploaded.value.file_id, 'uploaded-file');
+  assert.deepEqual(f.uploads, [{roomId: 'room', name: 'wechat-image.png', mime: 'image/png'}]);
+  for (const args of [{data_base64: png, mime_type: 'audio/wav'},
+    {data_base64: Buffer.from('private file').toString('base64'), mime_type: 'image/png'},
+    {data_base64: png, mime_type: 'image/png', roomId: 'other'}])
+    assert.equal((await bridge.invoke('upload_image', args)).error, 'dot_invalid_image_file');
+  assert.equal(f.uploads.length, 1);
+  await bridge.invoke('send', {requestId, text: '看图片', attachmentIds: ['uploaded-file']});
+  assert.deepEqual(f.sends[0].attachmentIds, ['uploaded-file']); bridge.dispose();
+});
+test('image download verifies the dot author and opaque attachment; no signed URL is returned', async () => {
+  const f = fixture({imageReply: true}); const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
+  const projected = await bridge.invoke('messages', {limit: 20});
+  assert.equal(projected.value.messages[0].images[0].attachment_id, 'image');
+  assert.equal(JSON.stringify(projected).includes('private-signed-media'), false);
+  const result = await bridge.invoke('download_image', {message_id: 'message', attachment_id: 'image', parent_id: 'parent'});
+  assert.equal(result.value.mime_type, 'image/png'); assert.equal(f.downloads.length, 1);
+  assert.equal((await bridge.invoke('download_image', {message_id: 'foreign', attachment_id: 'image', parent_id: 'parent'})).error,
+    'dot_image_message_unavailable');
+  assert.equal(f.downloads.length, 1); bridge.dispose();
 });

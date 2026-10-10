@@ -83,8 +83,12 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       }});
     stopIntegrity = room.subscribeSendIntegrity();
   } catch (error) { dispose(); throw error; }
-  // Return only projected text and correlation fields. No tokens, signed media,
+  // Return projected text, opaque image IDs and correlation fields. No tokens, signed media,
   // widgets, browser auth actions, raw message parts or internal tool output.
+  function isImage(attachment) {
+    return attachment && (['image/png', 'image/jpeg', 'image/webp'].includes(attachment.mime) ||
+      attachment.type === 'media' && attachment.hasPreview && attachment.contentType !== 'video');
+  }
   function project(message) {
     if (message.roomId !== roomId) throw new Error('dot_room_identity_mismatch');
     const aeon = message.messageMetadata?.aeon;
@@ -112,6 +116,9 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       createdAt: message.createdAt, updatedAt: message.updatedAt,
       deleted: Boolean(message.deletedAt), deliveryState: message.deliveryState,
       text: message.text, attachmentCount: message.attachments?.length ?? 0,
+      images: (message.attachments ?? []).filter(isImage).slice(0, 8).map(attachment => ({
+        attachment_id: attachment.attachmentId, file_id: attachment.fileId || null,
+        mime_type: attachment.mime || null, loading: Boolean(attachment.isLoading)})),
       questions, requiresUserAction: Boolean(elicitation),
       metadataKeys: Object.keys(message.messageMetadata ?? {}), aeonMetadata,
       turnTrigger: /^[a-z_]{1,80}$/.test(message.messageMetadata?.turn_trigger ?? '')
@@ -137,11 +144,13 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       if (operation === 'send') {
         if (sendInFlight) throw new Error('desktop_submission_in_progress');
         sendStarted = false; sendStartedAt = undefined;
-        if (Object.keys(args).some(key => !['requestId', 'text', 'replyToMessageId'].includes(key)) ||
+        if (Object.keys(args).some(key => !['requestId', 'text', 'replyToMessageId', 'attachmentIds'].includes(key)) ||
             !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(args.requestId ?? '') ||
             typeof args.text !== 'string' || !args.text.trim() || new TextEncoder().encode(args.text).length > 20000 ||
             (args.replyToMessageId != null && (typeof args.replyToMessageId !== 'string' ||
-              !args.replyToMessageId || args.replyToMessageId.length > 256)))
+              !args.replyToMessageId || args.replyToMessageId.length > 256)) ||
+            (args.attachmentIds != null && (!Array.isArray(args.attachmentIds) || args.attachmentIds.length > 8 ||
+              args.attachmentIds.some(id => typeof id !== 'string' || !id || id.length > 256 || /[\x00-\x20]/.test(id)))))
           throw new Error('dot_invalid_submission');
         // No retry here. Native client handles preparation and reports uncertainty.
         sendInFlight = true; sendStarted = false;
@@ -154,6 +163,61 @@ export async function createDesktopRoomBridge(shared, native, binding) {
             return {ok: false, error: 'dot_submission_unknown', delivery_unknown: true};
           throw error;
         } finally { sendInFlight = false; }
+      }
+      if (operation === 'upload_image') {
+        if (Object.keys(args).some(key => !['data_base64', 'mime_type'].includes(key)) ||
+            typeof args.data_base64 !== 'string' || args.data_base64.length > 5592408 ||
+            args.data_base64.length % 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(args.data_base64) ||
+            !['image/png', 'image/jpeg', 'image/webp'].includes(args.mime_type))
+          throw new Error('dot_invalid_image_file');
+        const binary = atob(args.data_base64);
+        const signature = args.mime_type === 'image/png' ? binary.startsWith('\x89PNG\r\n\x1a\n') :
+          args.mime_type === 'image/jpeg' ? binary.startsWith('\xff\xd8\xff') :
+          binary.startsWith('RIFF') && binary.slice(8, 12) === 'WEBP';
+        if (!signature || binary.length > 4 * 1024 * 1024)
+          throw new Error('dot_invalid_image_file');
+        const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+        const suffix = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp'}[args.mime_type];
+        const file = new File([bytes], 'wechat-image.' + suffix, {type: args.mime_type});
+        const uploaded = await room.media.upload(roomId, file, {
+          signal: controller.signal, onProgress() {}});
+        assertCurrent();
+        if (typeof uploaded?.fileId !== 'string' || !uploaded.fileId || uploaded.fileId.length > 256)
+          throw new Error('dot_image_upload_invalid_confirmation');
+        return {ok: true, value: {file_id: uploaded.fileId, mime_type: uploaded.mime,
+          status: uploaded.status, size_bytes: binary.length}};
+      }
+      if (operation === 'download_image') {
+        if (Object.keys(args).some(key => !['message_id', 'attachment_id', 'parent_id'].includes(key)) ||
+            ['message_id', 'attachment_id', 'parent_id'].some(key => typeof args[key] !== 'string' ||
+              !args[key] || args[key].length > 256))
+          throw new Error('dot_invalid_image_query');
+        let cursor = args.parent_id, message;
+        for (let pageIndex = 0; pageIndex < 5; pageIndex++) {
+          const page = await room.client.messages(roomId, {
+            replyRootMessageId: binding.reply_anchor_message_id, after: cursor, limit: 20});
+          message = page.messages.find(value => value.id === args.message_id);
+          if (message || !page.messages.length || !page.after) break;
+          cursor = page.messages.at(-1).id;
+        }
+        assertCurrent();
+        if (!message || message.self !== false || message.role !== 'user' ||
+            message.senderAeonId !== binding.dot_id ||
+            message.replyRootMessageId !== binding.reply_anchor_message_id)
+          throw new Error('dot_image_message_unavailable');
+        const attachment = message.attachments?.find(value => value.attachmentId === args.attachment_id);
+        if (!isImage(attachment)) throw new Error('dot_image_attachment_unavailable');
+        if (attachment.isLoading) throw new Error('dot_image_not_ready');
+        const result = await room.media.image(roomId, message.id, attachment, controller.signal);
+        assertCurrent();
+        if (!(result.image instanceof Blob) || !result.image.size) throw new Error('dot_image_not_ready');
+        if (result.image.size > 4 * 1024 * 1024) throw new Error('dot_image_too_large');
+        const bytes = new Uint8Array(await result.image.arrayBuffer());
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 32768)
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+        return {ok: true, value: {data_base64: btoa(binary), mime_type: result.image.type || attachment.mime,
+          size_bytes: bytes.length}};
       }
       if (operation === 'wait') {
         if (waiter) throw new Error('desktop_wait_already_active');
