@@ -24,6 +24,10 @@
 /usr/lib/chatgpt/ChatGPT --remote-debugging-address=127.0.0.1 --remote-debugging-port=9229
 ```
 
+后续已支持的文字消息固定默认使用直连，故障仅排队重连；只有用户明确要求时才执行人工回滚。broker 路由保存在私有数据库，重启会保留；两个用户级后台服务已启用。
+
+本机已为安装版 ChatGPT 的普通图标配置用户级启动覆盖：`~/.local/share/applications/chatgpt.desktop`，自动带上上述两个调试参数，保留 URL 打开参数 `%U`。当前进程无需为此再次重启。
+
 本机已实际核对监听地址为 `127.0.0.1`。调试端口可控制该应用，应仅用于本机。说明见 [Electron 官方文档](https://www.electronjs.org/docs/latest/api/command-line-switches#--remote-debugging-portport)。
 
 `dot_desktop.py` 仅连接 loopback，选取主窗口，排除头像窗口、独立窗口及嵌入网页；多个主窗口时要求 target ID。固定本地桥接代码导入已安装的两个 bundle，不修改 `app.asar`。桌面升级后需重新核对接口；它不是稳定公开 API。
