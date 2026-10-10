@@ -57,9 +57,14 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(q['server_id'],'opaque-server-reference')
         self.assertEqual(q['content_source'],'unavailable')
 
-    def test_embedded_item_id_is_not_misrepresented_as_server_reference_id(self):
-        mid=self.add(1,'正文',{'message_item':{'type':1,'msg_id':'item-id','text_item':{'text':'引用正文'}}})
+    def test_embedded_item_id_fallback_resolves_historical_message(self):
+        original=self.add(7514628646295365128,'将这张图原图发给我')
+        self.a.db.execute('DELETE FROM wechat_server_messages');self.a.db.commit()
+        mid=self.add(2,'我引用了一句话',{'message_item':{'msg_id':'7514628646295365128'}})
         q=read(self.a.db,mid)[0]
-        self.assertIsNone(q['server_id']);self.assertEqual(q['embedded_item_id'],'item-id')
+        self.assertEqual(q['server_id'],'7514628646295365128')
+        self.assertEqual(q['id_source'],'ref_msg.message_item.msg_id')
+        self.assertEqual(q['referenced_local_id'],original)
+        self.assertEqual(q['text'],'将这张图原图发给我')
 
 if __name__=='__main__':unittest.main()
