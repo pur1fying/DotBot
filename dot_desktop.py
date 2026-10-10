@@ -9,7 +9,7 @@ import contextlib
 import http.client
 import json
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from dot_auth import DotError
 
@@ -44,7 +44,9 @@ def select_target(targets, port, target_id=None):
             continue
         url = urlsplit(target.get('url', ''))
         # Only the packaged app renderer, never an embedded site or MCP widget.
-        if url.scheme != 'app' or url.hostname not in ('-', '.'):
+        route = parse_qs(url.query).get('initialRoute', [''])[0]
+        if (url.scheme != 'app' or url.hostname not in ('-', '.') or url.path != '/index.html' or
+                route in ('/avatar-overlay', '/detached-window')):
             continue
         endpoint = urlsplit(target.get('webSocketDebuggerUrl', ''))
         if (endpoint.scheme != 'ws' or endpoint.hostname != '127.0.0.1' or
@@ -151,7 +153,9 @@ class DesktopRoomClient:
                 category = response.get('error', 'desktop_room_request_failed')
                 if not isinstance(category, str) or len(category) > 80:
                     category = 'desktop_room_request_failed'
-                raise DotError(category, status=response.get('http_status'))
+                error = DotError(category, status=response.get('http_status'))
+                error.submission_started = response.get('submission_started')
+                raise error
             return response['value']
         except BaseException as error:
             # Once a renderer send is dispatched, a timeout/disconnection cannot

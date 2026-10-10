@@ -99,7 +99,7 @@ class Broker:
         if method == 'status' and not args:
             return dict(self.status)
         if method == 'build' and not args:
-            return {'broker_build': 'dot-direct-20261010', 'optional_ret_with_valid_id': True,
+            return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled, 'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
             if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
@@ -123,9 +123,30 @@ class Broker:
                     if method == 'read_relay':
                         result['messages'] = [m for m in result['messages']
                                               if adapter.dot.route(m['message_id']) == 'webhook']
+                        replay = adapter.db.execute("SELECT message_id FROM dot_jobs WHERE state='rolled_back' AND relay_replayed=0 ORDER BY received_at,rowid LIMIT 20").fetchall()
+                        replay_ids = []
+                        present = {m['message_id'] for m in result['messages']}
+                        for (mid,) in replay:
+                            if mid not in present:
+                                result['messages'].extend(adapter.read_page(message_id=mid)['messages'])
+                            replay_ids.append(mid)
+                        if replay_ids:
+                            result['replayed_message_ids'] = replay_ids
                     return {'channel_id': CHANNEL, **result}
                 finally:
                     adapter.close()
+        if method == 'relay_ack' and set(args) == {'message_ids'}:
+            ids = args['message_ids']
+            if not isinstance(ids, list) or len(ids) > 20 or any(not isinstance(mid, str) or not mid or len(mid) > 256 for mid in ids):
+                raise DotError('dot_invalid_arguments')
+            with self.lock:
+                adapter = self.adapter()
+                try:
+                    with adapter.db:
+                        adapter.db.executemany("UPDATE dot_jobs SET relay_replayed=1 WHERE message_id=? AND state='rolled_back'", [(mid,) for mid in ids])
+                finally:
+                    adapter.close()
+            return {}
         if method == 'reply' and set(args) == {'message_id', 'text', 'idempotency_key'}:
             # Serialize send operations, preserving durable ambiguity semantics.
             with self.lock:
@@ -172,14 +193,22 @@ class Broker:
         store = adapter.dot
         operations = {
             'dot_status': (set(), store.status),
+            'dot_metrics': (set(), store.metrics),
             'dot_binding': (set(), lambda: store.binding),
             'dot_bind': ({'binding'}, store.bind),
             'dot_activate': (set(), store.activate),
+            'dot_canary': (set(), lambda: store.activate(canary=True)),
             'dot_rollback': (set(), store.rollback),
+            'dot_recover': (set(), store.recover),
             'dot_next': (set(), store.next_job),
             'dot_submitting': ({'message_id'}, store.submitting),
             'dot_submitted': ({'message_id', 'turn_id', 'written_at', 'error'}, store.submitted),
             'dot_mark': ({'message_id', 'state', 'category'}, store.mark),
+            'dot_unsent': ({'message_id'}, store.unsent),
+            'dot_room_message': ({'message'}, store.room_message),
+            'dot_room_reconcile': (set(), store.reconcile_room_inbox),
+            'dot_room_cursor': (set(), store.room_cursor),
+            'dot_room_set_cursor': ({'cursor'}, store.room_cursor),
             'dot_item': ({'thread_id', 'item', 'completed'}, store.accept_item),
         }
         if method in operations:

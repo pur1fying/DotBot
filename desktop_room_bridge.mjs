@@ -15,7 +15,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
   if (!scope) throw new Error('desktop_window_not_ready');
   const controller = new AbortController();
   let stopIdentity, stopUpdates, stopIntegrity, waiter, lease, verified = false;
-  let subscribed = false, closed = false, sendInFlight = false, sendStarted = false;
+  let subscribed = false, closed = false, sendInFlight = false, sendStarted = false, sendStartedAt;
   const updates = [];
   function sameAccount() {
     return scope.get(shared.NOt) && scope.get(shared.AOt) === binding.account_id &&
@@ -55,7 +55,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
   let room;
   try { room = native.CN({scope, signal: controller.signal,
     accountId: binding.account_id, userId: binding.user_id, accountUserId,
-    conversationId: binding.thread_id, beforeSend() { sendStarted = true; },
+    conversationId: binding.thread_id, beforeSend() { sendStarted = true; sendStartedAt = Date.now() / 1000; },
     onRoomSnapshot(snapshot) {
       if (snapshot.id !== roomId || snapshot.type !== 'DM' ||
           snapshot.app_source !== 'chatgpt:messaging' || snapshot.aeon_id !== binding.dot_id ||
@@ -87,13 +87,35 @@ export async function createDesktopRoomBridge(shared, native, binding) {
   // widgets, browser auth actions, raw message parts or internal tool output.
   function project(message) {
     if (message.roomId !== roomId) throw new Error('dot_room_identity_mismatch');
+    const aeon = message.messageMetadata?.aeon;
+    const aeonMetadata = aeon && typeof aeon === 'object' ? Object.fromEntries(
+      ['version', 'threadId', 'messageId'].filter(key => typeof aeon[key] === 'number' ||
+        (typeof aeon[key] === 'string' && aeon[key].length <= 256)).map(key => [key, aeon[key]])) : undefined;
+    const elicitation = room.elicitations?.get(message.id);
+    const questions = [];
+    if (elicitation && typeof elicitation === 'object') {
+      const schema = elicitation.requestedSchema ?? elicitation.requested_schema;
+      if (schema?.properties && typeof schema.properties === 'object') {
+        for (const [key, value] of Object.entries(schema.properties)) {
+          if (!value || typeof value !== 'object') continue;
+          questions.push({title: typeof value.title === 'string' ? value.title : key,
+            options: Array.isArray(value.enum) ? value.enum.filter(option => typeof option === 'string') : []});
+        }
+      }
+      if (!questions.length && typeof elicitation.message === 'string')
+        questions.push({title: elicitation.message, options: []});
+    }
     return {id: message.id, roomId, role: message.role, self: message.self,
       senderAeonId: message.senderAeonId, requestId: message.requestId,
       replyToMessageId: message.replyTo?.messageId,
       replyRootMessageId: message.replyRootMessageId,
       createdAt: message.createdAt, updatedAt: message.updatedAt,
       deleted: Boolean(message.deletedAt), deliveryState: message.deliveryState,
-      text: message.text, attachmentCount: message.attachments?.length ?? 0};
+      text: message.text, attachmentCount: message.attachments?.length ?? 0,
+      questions, requiresUserAction: Boolean(elicitation),
+      metadataKeys: Object.keys(message.messageMetadata ?? {}), aeonMetadata,
+      turnTrigger: /^[a-z_]{1,80}$/.test(message.messageMetadata?.turn_trigger ?? '')
+        ? message.messageMetadata.turn_trigger : undefined};
   }
   async function invoke(operation, args = {}) {
     try {
@@ -114,6 +136,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       }
       if (operation === 'send') {
         if (sendInFlight) throw new Error('desktop_submission_in_progress');
+        sendStarted = false; sendStartedAt = undefined;
         if (Object.keys(args).some(key => !['requestId', 'text', 'replyToMessageId'].includes(key)) ||
             !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(args.requestId ?? '') ||
             typeof args.text !== 'string' || !args.text.trim() || new TextEncoder().encode(args.text).length > 20000 ||
@@ -125,7 +148,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
         try {
           const accepted = await room.client.send({...args, roomId});
           assertCurrent();
-          return {ok: true, value: project(accepted)};
+          return {ok: true, value: {...project(accepted), nativeSendStartedAt: sendStartedAt}};
         } catch (error) {
           if (sendStarted && !sameAccount())
             return {ok: false, error: 'dot_submission_unknown', delivery_unknown: true};
@@ -148,6 +171,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       return {ok: false, error: known.test(error?.message ?? '') ? error.message :
         error?.deliveryUnknown ? 'dot_submission_unknown' : 'desktop_room_request_failed',
         delivery_unknown: error?.deliveryUnknown === true,
+        submission_started: operation === 'send' ? sendStarted : undefined,
         http_status: Number.isInteger(error?.status) ? error.status : null};
     }
   }

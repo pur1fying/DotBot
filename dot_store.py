@@ -11,10 +11,11 @@ from dot_auth import DotError
 
 REPLY_WINDOW = 3600
 TERMINAL = ('api_accepted', 'failed', 'expired', 'rolled_back')
+CANARY_PREFIX = '【DotBot直连测试】'
 
 
 def initialize(db):
-    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('1',):
+    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('2',):
         return
     db.executescript('''
       CREATE TABLE IF NOT EXISTS bridge_routes (
@@ -37,11 +38,21 @@ def initialize(db):
       CREATE TABLE IF NOT EXISTS dot_metrics (
         message_id TEXT NOT NULL, stage TEXT NOT NULL, at REAL NOT NULL,
         PRIMARY KEY (message_id,stage));
+      CREATE TABLE IF NOT EXISTS dot_room_messages (
+        room_message_id TEXT PRIMARY KEY, message_id TEXT NOT NULL, parent_id TEXT,
+        received_at REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS dot_room_inbox (
+        room_message_id TEXT PRIMARY KEY, payload TEXT NOT NULL, received_at REAL NOT NULL);
     ''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(dot_jobs)')}
+    for name, sql_type in (('room_message_id', 'TEXT'), ('relay_replayed', 'INTEGER NOT NULL DEFAULT 0')):
+        if name not in columns:
+            db.execute(f'ALTER TABLE dot_jobs ADD COLUMN {name} {sql_type}')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS dot_jobs_room_message ON dot_jobs(room_message_id)')
     # Existing messages stay on their original route; activating never replays history.
     with db:
         db.execute("INSERT OR IGNORE INTO bridge_routes SELECT id,'webhook',received FROM messages")
-        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','1')")
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','2')")
 
 
 def split_text(text, limit=2000):
@@ -110,6 +121,8 @@ class DotStore:
 
     def bind(self, binding):
         required = {'account_id', 'user_id', 'dot_id', 'thread_id', 'name', 'protocol_verified'}
+        if isinstance(binding, dict) and binding.get('transport') == 'desktop_native_room':
+            required |= {'transport', 'messaging_room_id', 'reply_anchor_message_id'}
         if not isinstance(binding, dict) or set(binding) != required:
             raise DotError('dot_invalid_binding')
         if any(not isinstance(binding[k], str) or not 0 < len(binding[k]) <= 256
@@ -119,12 +132,20 @@ class DotStore:
                 "SELECT 1 FROM dot_jobs WHERE state NOT IN ('api_accepted','failed','expired','rolled_back') LIMIT 1").fetchone():
             raise DotError('dot_binding_in_use')
         with self.db:
+            if self.binding != binding:
+                self._put('room_cursor', binding.get('reply_anchor_message_id'))
             self._put('binding', binding)
         return {'bound': True, 'protocol_verified': binding['protocol_verified']}
 
     def record_incoming(self, message_id, received_at, *, force_webhook=False):
         """Called inside the message-ingest transaction, before its commit."""
-        route = 'webhook' if force_webhook else self.mode
+        route = 'webhook'
+        if not force_webhook and self.mode == 'direct':
+            route = 'direct'
+        elif not force_webhook and self.mode == 'canary':
+            row = self.db.execute('SELECT text FROM messages WHERE id=?', (message_id,)).fetchone()
+            if row and row[0].startswith(CANARY_PREFIX):
+                route = 'direct'
         self.db.execute('INSERT OR IGNORE INTO bridge_routes VALUES (?,?,?)',
                         (message_id, route, self.now()))
         if route == 'direct':
@@ -137,7 +158,7 @@ class DotStore:
         row = self.db.execute('SELECT route FROM bridge_routes WHERE message_id=?', (message_id,)).fetchone()
         return row[0] if row else 'webhook'
 
-    def activate(self):
+    def activate(self, *, canary=False):
         if not self.binding or not self.binding['protocol_verified']:
             raise DotError('dot_protocol_unverified')
         with self.db:
@@ -150,11 +171,12 @@ class DotStore:
               (self.now() - REPLY_WINDOW, self.now())).fetchone():
                 raise DotError('webhook_messages_in_progress')
             cutoff = self.db.execute('SELECT COALESCE(MAX(rowid),0) FROM messages').fetchone()[0]
-            self._put('mode', 'direct')
+            self._put('mode', 'canary' if canary else 'direct')
             self._put('cutover_seq', cutoff)
-        return {'mode': 'direct', 'cutover_seq': cutoff}
+        return {'mode': self.mode, 'cutover_seq': cutoff}
 
     def rollback(self):
+        self.expire()
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             self._put('mode', 'webhook')
@@ -186,13 +208,13 @@ class DotStore:
         if row is None:
             return None
         job = self.job(row[0])
-        if job['state'] == 'queued' and self.mode != 'direct':
+        if job['state'] == 'queued' and self.mode not in ('direct', 'canary'):
             return None
         return job
 
     def submitting(self, message_id):
         self.expire()
-        if self.mode != 'direct':
+        if self.mode not in ('direct', 'canary'):
             raise DotError('dot_route_disabled')
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
@@ -217,7 +239,7 @@ class DotStore:
               turn_id=COALESCE(turn_id,?),error_category=? WHERE message_id=?''',
               (state, written_at, None if error else self.now(), turn_id, error, message_id))
             if written_at is not None:
-                self.metric(message_id, 'ws_written', written_at)
+                self.metric(message_id, 'native_send_started' if (self.binding or {}).get('transport') == 'desktop_native_room' else 'ws_written', written_at)
             if not error:
                 self.metric(message_id, 'admitted')
 
@@ -255,7 +277,9 @@ class DotStore:
         if self.now() - job['received_at'] > REPLY_WINDOW:
             self.expire()
             return {'accepted': False, 'category': 'reply_window_expired'}
-        text = visible_text(item)
+        return self._enqueue(message_id, item_id, visible_text(item))
+
+    def _enqueue(self, message_id, item_id, text):
         if not text.strip():
             return {'accepted': False, 'category': 'dot_empty_reply'}
         digest = hashlib.sha256(text.encode()).hexdigest()
@@ -279,6 +303,88 @@ class DotStore:
                             (self.now(), message_id))
             self.metric(message_id, 'reply_complete')
         return {'accepted': True, 'message_id': message_id, 'parts': len(parts)}
+
+    def unsent(self, message_id):
+        """Only a proven pre-send failure may return to queued with the same ID."""
+        with self.db:
+            result = self.db.execute("UPDATE dot_jobs SET state='queued',error_category=NULL WHERE message_id=? AND state='submitting' AND room_message_id IS NULL", (message_id,))
+            if result.rowcount != 1:
+                raise DotError('dot_submission_not_proven_unsent')
+
+    def room_message(self, message):
+        binding = self.binding or {}
+        if (binding.get('transport') != 'desktop_native_room' or not isinstance(message, dict) or
+                message.get('roomId') != binding.get('messaging_room_id') or
+                message.get('deleted') or message.get('deliveryState') not in ('', None)):
+            return {'accepted': False}
+        iid = message.get('id')
+        if not isinstance(iid, str) or not 0 < len(iid) <= 256:
+            raise DotError('dot_invalid_room_message')
+        if message.get('self') is True and message.get('role') == 'user':
+            row = self.db.execute("SELECT message_id,room_message_id FROM dot_jobs WHERE client_message_id=? AND state NOT IN ('queued','expired','rolled_back')", (message.get('requestId'),)).fetchone()
+            if not row:
+                return {'accepted': False}
+            if message.get('replyToMessageId') != binding['reply_anchor_message_id']:
+                raise DotError('dot_room_submission_parent_mismatch')
+            if row[1] is not None and row[1] != iid:
+                raise DotError('dot_submission_id_conflict')
+            with self.db:
+                self.db.execute('UPDATE dot_jobs SET room_message_id=? WHERE message_id=?', (iid, row[0]))
+                self.db.execute('INSERT OR IGNORE INTO dot_room_messages VALUES (?,?,?,?)',
+                                (iid, row[0], message.get('replyToMessageId'), self.now()))
+                self.submitted(row[0])
+            return {'accepted': True, 'admission': True, 'message_id': row[0]}
+        if (message.get('self') is not False or message.get('role') != 'user' or
+                message.get('senderAeonId') != binding.get('dot_id') or
+                message.get('turnTrigger') != 'chatgpt_messaging' or
+                message.get('replyRootMessageId') != binding['reply_anchor_message_id']):
+            return {'accepted': False}
+        parent = message.get('replyToMessageId')
+        row = self.db.execute('SELECT message_id FROM dot_room_messages WHERE room_message_id=?', (parent,)).fetchone()
+        if not row:
+            with self.db:
+                self.db.execute('INSERT OR IGNORE INTO dot_room_inbox VALUES (?,?,?)',
+                                (iid, json.dumps(message, ensure_ascii=False), self.now()))
+            return {'accepted': False, 'category': 'dot_reply_parent_unmatched'}
+        job = self.job(row[0])
+        if not job or job['state'] in ('queued', 'expired', 'rolled_back') or self.now() - job['received_at'] > REPLY_WINDOW:
+            return {'accepted': False, 'category': 'reply_window_expired'}
+        text = visible_text(message)
+        if not text.strip():
+            text = '爱丽丝发来需要确认的请求，请打开 Codex 查看并处理。'
+        result = self._enqueue(row[0], iid, text)
+        with self.db:
+            self.db.execute('INSERT OR IGNORE INTO dot_room_messages VALUES (?,?,?,?)',
+                            (iid, row[0], parent, self.now()))
+            self.db.execute('DELETE FROM dot_room_inbox WHERE room_message_id=?', (iid,))
+            if message.get('requiresUserAction'):
+                self.db.execute("UPDATE dot_jobs SET error_category='dot_requires_user_action' WHERE message_id=?", (row[0],))
+        return result
+
+    def reconcile_room_inbox(self):
+        accepted = 0
+        with self.db:
+            self.db.execute('DELETE FROM dot_room_inbox WHERE received_at<?', (self.now() - REPLY_WINDOW,))
+        while True:
+            progress = False
+            for (payload,) in self.db.execute('SELECT payload FROM dot_room_inbox ORDER BY received_at,rowid').fetchall():
+                message = json.loads(payload)
+                if not self.db.execute('SELECT 1 FROM dot_room_messages WHERE room_message_id=?', (message.get('replyToMessageId'),)).fetchone():
+                    continue
+                result = self.room_message(message)
+                if result.get('accepted') or result.get('duplicate'):
+                    accepted += int(result.get('accepted', False))
+                    progress = True
+            if not progress:
+                return {'accepted': accepted}
+
+    def room_cursor(self, cursor=None):
+        if cursor is not None:
+            if not isinstance(cursor, str) or not 0 < len(cursor) <= 256:
+                raise DotError('dot_invalid_room_cursor')
+            with self.db:
+                self._put('room_cursor', cursor)
+        return self._get('room_cursor') or (self.binding or {}).get('reply_anchor_message_id')
 
     def next_part(self):
         self.expire()
@@ -315,4 +421,12 @@ class DotStore:
         counts = dict(self.db.execute('SELECT state,COUNT(*) FROM dot_jobs GROUP BY state').fetchall())
         return {'mode': self.mode, 'binding': self.binding, 'jobs': counts,
                 'outbox': dict(self.db.execute('SELECT state,COUNT(*) FROM dot_outbox GROUP BY state').fetchall()),
+                'unmatched_room_messages': self.db.execute('SELECT COUNT(*) FROM dot_room_inbox').fetchone()[0],
                 'cutover_seq': self._get('cutover_seq')}
+
+    def metrics(self):
+        result = []
+        for mid, received, state in self.db.execute('SELECT message_id,received_at,state FROM dot_jobs ORDER BY received_at DESC LIMIT 100'):
+            stages = dict(self.db.execute('SELECT stage,at FROM dot_metrics WHERE message_id=?', (mid,)))
+            result.append({'message_id': mid, 'received_at': received, 'state': state, 'stages': stages})
+        return {'jobs': result}

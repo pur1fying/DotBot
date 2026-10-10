@@ -1,0 +1,18 @@
+[Unit]
+Description=DotBot owner-only WeChat broker
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@SOURCE@
+ExecStart=/usr/bin/python3 -B @SOURCE@/ilink_broker.py
+UMask=0077
+UnsetEnvironment=OPENAI_API_KEY CONTROL_PLANE_API_KEY CODEX_APP_TOOLS_PIPE_PATH
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target

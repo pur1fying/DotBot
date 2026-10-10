@@ -10,9 +10,75 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 
 from dot_auth import CodexAuth, DotError
 from dot_transport import DotClient, DotHTTP
+from ilink_ipc import BrokerError
+
+
+def read_private_json(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 16384:
+            raise DotError('dot_unsafe_verification_file')
+        return json.load(stream)
+
+
+async def operations(args):
+    from ilink_ipc import call
+    from dot_desktop import DesktopRoomClient
+    from dot_runner import Gateway, serve
+    async def broker(method, values=None):
+        return await asyncio.to_thread(call, method, values, args.broker_socket)
+    if args.command == 'serve':
+        await serve(args.broker_socket, args.state_dir, port=args.debug_port, target_id=args.desktop_target)
+        return {}
+    if args.command == 'bind':
+        if not args.verification:
+            raise DotError('dot_verification_file_required')
+        proof = read_private_json(args.verification)
+        if proof.get('protocol') != 'desktop_room_reply_v1' or proof.get('verified') is not True:
+            raise DotError('dot_protocol_unverified')
+        binding = proof.get('binding', {})
+        room = DesktopRoomClient(port=args.debug_port, target_id=args.desktop_target)
+        try:
+            await room.open(binding)
+            result = await broker('dot_bind', {'binding': binding})
+            await broker('dot_room_set_cursor', {'cursor': proof['initial_room_cursor']})
+            return result
+        finally:
+            await room.close()
+    if args.command == 'status':
+        result = await broker('dot_status')
+        try:
+            result['gateway'] = read_private_json(args.state_dir / 'gateway-status.json')
+        except (OSError, ValueError, DotError):
+            result['gateway'] = {'state': 'unavailable'}
+        return result
+    if args.command in ('activate', 'canary'):
+        health = read_private_json(args.state_dir / 'gateway-status.json')
+        age = time.time() - datetime.fromisoformat(health['updated_at']).timestamp()
+        if health.get('state') != 'ready' or not 0 <= age <= 60:
+            raise DotError('dot_gateway_not_ready')
+        return await broker('dot_canary' if args.command == 'canary' else 'dot_activate')
+    if args.command == 'rollback':
+        return await broker('dot_rollback')
+    if args.command == 'metrics':
+        return await broker('dot_metrics')
+    if args.command == 'reconcile':
+        binding = await broker('dot_binding')
+        if not binding:
+            raise DotError('dot_not_bound')
+        room = DesktopRoomClient(port=args.debug_port, target_id=args.desktop_target)
+        try:
+            await room.open(binding)
+            await Gateway(broker, room, binding).read_history()
+            return await broker('dot_status')
+        finally:
+            await room.close()
+    raise DotError('dot_operation_not_allowed')
 
 
 def candidate_from_response(response, identity, source):
@@ -92,6 +158,10 @@ async def preflight(auth, *, cache_path=None, http=None, client_factory=DotClien
 
 
 async def run(args):
+    if args.command not in ('preflight', 'preflight-desktop'):
+        result = await operations(args)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     auth = CodexAuth(args.codex)
     try:
         if args.command == 'preflight-desktop':
@@ -126,19 +196,27 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['preflight', 'preflight-desktop'])
+    parser.add_argument('command', choices=['preflight', 'preflight-desktop', 'bind', 'status',
+                                          'serve', 'reconcile', 'canary', 'activate', 'rollback', 'metrics'])
     parser.add_argument('--codex', default='/usr/lib/chatgpt/resources/codex')
     parser.add_argument('--desktop-state', type=Path, default=Path.home()/'.codex/.codex-global-state.json')
     parser.add_argument('--output', help='Private JSON result; no token or message content')
     parser.add_argument('--debug-port', type=int, default=9229,
                         help='Already enabled desktop debugging port on 127.0.0.1')
     parser.add_argument('--desktop-target', help='Exact renderer target ID when multiple app windows are open')
+    parser.add_argument('--broker-socket', type=Path,
+                        default=Path(__file__).parent / 'runtime/wechat-private/broker.sock')
+    parser.add_argument('--state-dir', type=Path, default=Path(__file__).parent / 'runtime/dot-private')
+    parser.add_argument('--verification', type=Path, help='Private result of a verified native room reply test')
     args = parser.parse_args()
     try:
         return asyncio.run(run(args))
     except DotError as error:
         print(json.dumps({'ready_to_activate': False, 'error': error.category,
                           'http_status': error.status, 'rpc_code': error.code}))
+        return 2
+    except BrokerError as error:
+        print(json.dumps({'error': error.category}))
         return 2
     except KeyboardInterrupt:
         return 130

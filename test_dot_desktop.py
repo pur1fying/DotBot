@@ -19,6 +19,11 @@ class DesktopTargetTest(unittest.TestCase):
                 select_target(records, 9229)
         self.assertEqual(select_target([target(), target(id='second')], 9229, 'second')['id'], 'second')
 
+    def test_avatar_and_detached_windows_are_not_primary_renderers(self):
+        self.assertEqual(select_target([
+            target(id='avatar', url='app://-/index.html?initialRoute=%2Favatar-overlay'),
+            target(id='detached', url='app://-/detached-window.html'), target()], 9229)['id'], 'main')
+
 
 class DesktopDispatchTest(unittest.IsolatedAsyncioTestCase):
     async def test_send_timeout_is_unknown_and_never_retried(self):

@@ -25,7 +25,7 @@ from ilink_adapter import AdapterError, READ_PAGE_SIZE, validate_read_arguments
 
 FIXTURE_SECRET = "whsec_" + base64.b64encode(b"offline-test-fixture-key-32-bytes!").decode()
 VERSIONS = ["2026-07-28"]
-SERVER_INFO = {"name": "wechat-dot-synthetic-bridge", "version": "0.4.3"}
+SERVER_INFO = {"name": "wechat-dot-synthetic-bridge", "version": "0.5.0"}
 
 
 class RPCError(Exception):
@@ -435,11 +435,14 @@ class PersistentService:
                 self.db.execute("INSERT OR IGNORE INTO messages VALUES (?,?,?,?)", (mid, "wechat-owner", message["text"], body))
                 for (sid,) in self.db.execute("SELECT id FROM subscriptions WHERE channel='wechat-owner' AND expiry>?", (self.now(),)).fetchall():
                     self.db.execute("INSERT OR IGNORE INTO deliveries(subscription_id,message_id,state) VALUES (?,?,'pending')", (sid, mid))
-                self.db.execute("INSERT OR REPLACE INTO wechat_cursor VALUES (1,?)", (message["local_seq"],))
+                if message['local_seq'] > after:
+                    self.db.execute("INSERT OR REPLACE INTO wechat_cursor VALUES (1,?)", (message["local_seq"],))
         next_cursor = result.get('next_after_seq')
         if type(next_cursor) is int and next_cursor > after:
             with self.db:
                 self.db.execute('INSERT OR REPLACE INTO wechat_cursor VALUES (1,?)', (next_cursor,))
+        if result.get('replayed_message_ids'):
+            self.wechat('relay_ack', {'message_ids': result['replayed_message_ids']})
         return self.flush()
 
     def receive(self, message_id, text):
