@@ -28,6 +28,8 @@
 
 微信下载采用 `image_item.media`，没有采用 `thumb_media`，与 [腾讯官方媒体下载实现](https://github.com/Tencent/openclaw-weixin/blob/main/src/media/media-download.ts) 相同。官方 [类型定义](https://github.com/Tencent/openclaw-weixin/blob/main/src/api/types.ts) 将 media 标作原图引用，但本轮实际返回的媒体已经小于用户报告的本地原文件。未拿到手机原始文件，不能确定第一次变化的具体压缩参数或 PNG/JPEG 格式转换情况；未验证存在另一个可取回 3 MB 源文件的接口。
 
+原图勾选复测（2026-10-10）：用户确认勾选微信“原图”后重新发送同一张图，local_seq=53 入站仍为 352,797 字节、1206×2622 的 JPEG，与 local_seq=51 缓存逐字节相同。该结果证明当前下载路径在勾选原图后仍未取得用户报告的约 3 MB 手机源文件；尚不能区分微信/iLink 只暴露处理后的版本与 CDN 默认下载选择了该版本。腾讯仓库的 [issue #241](https://github.com/Tencent/openclaw-weixin/issues/241) 有同类用户复现报告，当前为 Open；这是用户报告，不能当作腾讯已确认的服务端策略。对应私有记录为 `wechat-original-image-retest.json`。
+
 本机私有记录位于独立运行目录的 `image-gateway-enablement.json`、`native-image-capability-probe.json`、`native-image-return-probe.json`、`wechat-image-e2e-test.json`，图片、绑定、实际 ID、缓存和数据库不进入 Git。
 
 ## 启用方式
