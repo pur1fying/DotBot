@@ -30,6 +30,27 @@
 
 原图勾选复测（2026-10-10）：用户确认勾选微信“原图”后重新发送同一张图，local_seq=53 入站仍为 352,797 字节、1206×2622 的 JPEG，与 local_seq=51 缓存逐字节相同。该结果证明当前下载路径在勾选原图后仍未取得用户报告的约 3 MB 手机源文件；尚不能区分微信/iLink 只暴露处理后的版本与 CDN 默认下载选择了该版本。腾讯仓库的 [issue #241](https://github.com/Tencent/openclaw-weixin/issues/241) 有同类用户复现报告，当前为 Open；这是用户报告，不能当作腾讯已确认的服务端策略。对应私有记录为 `wechat-original-image-retest.json`。
 
+## 原图下载接口核查（2026-10-10）
+
+本轮检索腾讯项目 issue/PR、媒体下载实现及提交历史，并对照当前 npm 2.4.9。未找到已确认、可复现的图片消息原图下载修复或质量选择参数。#28、#241 均为 Open 且无评论；#235 的关闭原因是转为英文 #241，并非问题修复。公开用户报告支持存在同类现象，不构成腾讯对服务端策略的确认。
+
+| 项目 | 本地与官方对照 |
+|---|---|
+| 入站接口 | POST `/ilink/bot/getupdates`，完成态 type=2 的 `image_item` |
+| 引用选择 | 使用 `image_item.media`，不选择 `thumb_media`；优先 `media.full_url` |
+| 无完整 URL 时 | GET `/c2c/download?encrypted_query_param=...`，与官方 URL builder 相同 |
+| 解密 | 优先 `image_item.aeskey` hex，兼容 `media.aes_key` 两种 base64 编码；AES-128-ECB / PKCS#7 |
+| 图像处理 | 下载完整 bytes 后校验和缓存，不缩放、不重编码；4 MiB 上限超出即拒绝，不生成压缩替代品 |
+| 协议版本 | 本地声明 2.4.9，与本次 npm latest 相同；未发现升级即可恢复原图的依据 |
+
+真实下载对照使用 local_seq=53 的既有图片引用：服务器完整 URL 含 `encrypted_query_param` 和 `taskid`；另构造相同授权参数、去除 taskid 的官方单参数 URL。两次下载均得到 352,797 字节、1206×2622 JPEG，与既有缓存逐字节相同。该读操作没有改变收件游标或发送消息；不声称比较了原始消息内另一条未保存的 CDN 引用。结果在私有 `image-download-form-comparison.json`。
+
+发现并修正一个独立兼容性问题：本地此前仅接受 `encrypt_type=1`，现在支持官方定义的 0/1 两种元数据模式，拒绝未知值和错误类型。该修正已部署，媒体与图片直连相关 44 项检查通过，运行模式仍为 direct。该字段不是图像质量选择器，官方下载器不据此切换高清版本。local_seq=53 在旧校验下已成功接收，说明本次 353 KB 现象并非该拒绝造成。
+
+可验证的备选为文件通道：官方 type=4 的 `file_item.media` 有独立原字节下载分支，可研究将图片按文件或归档传输，再比较原始 bytes。DotBot 当前 `--images` 不接受图片文件/ZIP，此备选尚未接入或完成实测，不能直接承诺保留手机源文件。
+
+依据：[官方收件下载](https://github.com/Tencent/openclaw-weixin/blob/main/src/media/media-download.ts)、[CDN URL 构造](https://github.com/Tencent/openclaw-weixin/blob/main/src/cdn/cdn-url.ts)、[解密与 URL 优先级](https://github.com/Tencent/openclaw-weixin/blob/main/src/cdn/pic-decrypt.ts)、[字段定义](https://github.com/Tencent/openclaw-weixin/blob/main/src/api/types.ts)、[issue #28](https://github.com/Tencent/openclaw-weixin/issues/28)、[issue #241](https://github.com/Tencent/openclaw-weixin/issues/241)。
+
 本机私有记录位于独立运行目录的 `image-gateway-enablement.json`、`native-image-capability-probe.json`、`native-image-return-probe.json`、`wechat-image-e2e-test.json`，图片、绑定、实际 ID、缓存和数据库不进入 Git。
 
 ## 启用方式

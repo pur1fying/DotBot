@@ -144,6 +144,13 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(len(self.cdn.calls), 1)
         self.assertEqual(os.stat(self.directory / 'messages.sqlite').st_mode & 0o077, 0)
 
+    def test_mode_zero_image_is_ingested_and_decrypted(self):
+        item = image_item(); item['image_item']['media']['encrypt_type'] = 0
+        self.assertEqual(self.ingest(self.message([item]))['accepted'], 1)
+        result = self.tool('wechat_read_media', self.media_args())
+        self.assertEqual(result['content'][1]['type'], 'image')
+        self.assertEqual(base64.b64decode(result['content'][1]['data']), png())
+
     def test_wav_voice_is_audio_block_and_transcript_is_labeled(self):
         self.ingest(self.message([voice_item('外部转写')]))
         self.assertIn('微信提供的语音转写', self.read()['text'])
@@ -377,6 +384,24 @@ class MediaTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_primary_image_full_url_is_preferred_and_thumbnail_is_not_selected(self):
+        field = image_item()['image_item']
+        field['media']['full_url'] = CDN_BASE + '/download?encrypted_query_param=primary&taskid=fixture'
+        field['thumb_media'] = {'full_url': CDN_BASE + '/download?encrypted_query_param=thumbnail'}
+        ref = reference(field, 'image')
+        self.assertEqual(ref['url'], field['media']['full_url'])
+        self.assertEqual(ref['key'], KEY.hex())
+
+    def test_defined_encryption_metadata_modes_and_invalid_values(self):
+        for mode in (0, 1):
+            field = image_item()['image_item']; field['media']['encrypt_type'] = mode
+            ref = reference(field, 'image')
+            self.assertEqual(ref['key'], KEY.hex())
+            self.assertIn('encrypted_query_param=SYNTHETIC', ref['url'])
+        for mode in (False, True, 2, -1, '1', None):
+            field = image_item()['image_item']; field['media']['encrypt_type'] = mode
+            with self.assertRaises(MediaError): reference(field, 'image')
+
     def test_key_encodings_and_image_precedence(self):
         for encoded in [base64.b64encode(KEY).decode(), base64.b64encode(KEY.hex().encode()).decode()]:
             self.assertEqual(aes_key(encoded), KEY)

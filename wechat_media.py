@@ -160,7 +160,13 @@ def cdn_url(url, operation):
 
 def reference(item, kind):
     media = item.get('media')
-    if not isinstance(media, dict) or media.get('encrypt_type', 1) != 1:
+    if not isinstance(media, dict):
+        raise MediaError('invalid_media_reference')
+    # Tencent defines modes 0 (file ID metadata) and 1 (packed image metadata).
+    # Both use the supplied CDN reference and the same payload AES key. The
+    # official downloader does not select image quality using this field.
+    mode = media.get('encrypt_type', 1)
+    if type(mode) is not int or mode not in (0, 1):
         raise MediaError('invalid_media_reference')
     full = media.get('full_url')
     param = media.get('encrypt_query_param')
