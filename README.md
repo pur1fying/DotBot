@@ -16,7 +16,7 @@
 
 Cloudflare DoH 在进程内按 A/AAAA 分别缓存已验证的公网地址，取地址及 CNAME 的最短 TTL，扣除 HTTP `Age` 和查询耗时，最多缓存 300 秒；TTL 无效、空结果和失败不缓存，也不回退到过期地址。并发查询共用一次解析。事件出口配置不变时复用传输对象，但每次操作仍重读配置；禁用、缺失、无效或变更配置会丢弃旧缓存。重启后首次查询为冷缓存。
 
-dot 直连仍处于开发阶段：已实现登录/协议预检及 broker 持久队列基础，尚未提供生产常驻网关和切换命令。当前主 dot 的实测结果为 `canAcceptDirectInput=false`，需要消息房间接口，不能使用旧的 `turn/addUserMessage` 路径；预检会明确拒绝就绪，原 webhook 路由为默认值。实现边界与预检方式见 [直连接入状态](docs/DIRECT_GATEWAY.md)。
+dot 直连仍处于开发阶段：已实现登录/协议预检、broker 持久队列基础，以及复用桌面原生房间客户端的适配器；尚未完成真实房间发送验收、生产常驻网关和切换命令。桌面适配器需要已开启本机调试入口的 Codex 进程，当前不会自动重启或修改应用。主 dot 的实测结果为 `canAcceptDirectInput=false`，不能使用旧的 `turn/addUserMessage` 路径；预检会明确拒绝就绪，原 webhook 路由为默认值。实现边界与预检方式见 [直连接入状态](docs/DIRECT_GATEWAY.md)。
 
 离线测试：
 

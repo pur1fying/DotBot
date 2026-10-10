@@ -94,7 +94,24 @@ async def preflight(auth, *, cache_path=None, http=None, client_factory=DotClien
 async def run(args):
     auth = CodexAuth(args.codex)
     try:
-        result = await preflight(auth, cache_path=args.desktop_state)
+        if args.command == 'preflight-desktop':
+            from dot_desktop import DesktopRoomClient
+            authorization = await auth.get()
+            candidate = desktop_candidate(args.desktop_state, authorization.identity)
+            client = DesktopRoomClient(port=args.debug_port, target_id=args.desktop_target)
+            try:
+                status = await client.open(candidate)
+                # Verify a read as well as the room snapshot without logging content.
+                page = await client.invoke('messages', {'limit': 1})
+                result = {'checked_at': datetime.now(timezone.utc).isoformat(),
+                          'candidate': candidate, **status,
+                          'history_read': 'ok', 'history_sample_count': len(page['messages']),
+                          'application_message_sent': False, 'ready_to_activate': False,
+                          'blocker': 'dot_room_reply_protocol_not_yet_verified'}
+            finally:
+                await client.close()
+        else:
+            result = await preflight(auth, cache_path=args.desktop_state)
     finally:
         await auth.close()
     if args.output:
@@ -109,10 +126,13 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['preflight'])
+    parser.add_argument('command', choices=['preflight', 'preflight-desktop'])
     parser.add_argument('--codex', default='/usr/lib/chatgpt/resources/codex')
     parser.add_argument('--desktop-state', type=Path, default=Path.home()/'.codex/.codex-global-state.json')
     parser.add_argument('--output', help='Private JSON result; no token or message content')
+    parser.add_argument('--debug-port', type=int, default=9229,
+                        help='Already enabled desktop debugging port on 127.0.0.1')
+    parser.add_argument('--desktop-target', help='Exact renderer target ID when multiple app windows are open')
     args = parser.parse_args()
     try:
         return asyncio.run(run(args))
