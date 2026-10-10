@@ -131,20 +131,15 @@ class MediaAdapter(TextAdapter):
             self.db.execute('DELETE FROM staged_media WHERE expires<=?', (self.clock(),))
             self.db.execute("UPDATE tts_generations SET state='expired',media_id=NULL WHERE expires<=? AND state!='forgotten'", (self.clock(),))
 
-    def read_messages(self, after_seq=0, limit=20, message_id=None):
+    def read_page(self, after_seq=0, limit=20, message_id=None, *, pending_only=False):
         self.prune()
-        if message_id is None:
-            messages = super().read_messages(after_seq, limit)
-        else:
-            messages = [{"message_id": r[0], "text": r[1], "session_id": self.session,
-                         "trust": "untrusted_external_data", "grants_permissions": False, "local_seq": r[2]}
-                        for r in self.db.execute('SELECT id,text,rowid FROM messages WHERE id=?', (message_id,))]
-        for msg in messages:
+        page = super().read_page(after_seq, limit, message_id, pending_only=pending_only)
+        for msg in page['messages']:
             msg['attachments'] = []
             for aid, kind, state, metadata in self.db.execute('SELECT id,kind,state,metadata FROM media WHERE message_id=? ORDER BY rowid', (msg['message_id'],)):
                 msg['attachments'].append({'media_id': aid, 'kind': kind, 'state': state,
                                            **(json.loads(metadata) if metadata else {})})
-        return messages
+        return page
 
     def read_media(self, message_id, media_id):
         self.prune()

@@ -4,7 +4,8 @@
 
 | 工具 | 输入 | 结果 |
 |---|---|---|
-| `wechat_read_messages` | `{}`，或 `{message_id}`，或 `{after_seq}`；后两者互斥 | 最多 20 条消息及脱敏附件 ID；描述符不是媒体输入 |
+| `wechat_read_messages` | 可选 `message_id` 或 `after_seq`（互斥），可选 `limit`（1–20） | 消息、收件时间、回复状态、分页信息及附件 ID；描述符不是媒体输入 |
+| `wechat_read_pending_messages` | 可选 `after_seq`、`limit` | 一小时内从未尝试回复的消息；[查询语义](MESSAGE_QUERIES.md) |
 | `wechat_read_media` | `message_id, media_id` | 同消息的 MCP image/audio 内容块；SILK 缺解码器返回 decoder_required，无 audio block |
 | `wechat_generate_audio` | `message_id, text, idempotency_key` | 已有 owner 消息下生成/暂存 WAV，返回 `media_id, staged=true, sent=false`；不上传、不发送 |
 | `wechat_reply_media` | `message_id, mime_type, delivery_mode, idempotency_key`；`media_id` / `data_base64` 二选一 | 图片或 WAV 文件附件，API 状态与手机回执分开 |

@@ -14,7 +14,7 @@ import struct
 import threading
 import time
 import argparse
-from ilink_adapter import Binding, TextAdapter, AdapterError, API_HOST
+from ilink_adapter import Binding, TextAdapter, AdapterError, API_HOST, validate_read_arguments
 from ilink_transport import ILinkHTTPS
 from outbound import CallbackError
 from wechat_media import MAX_FRAME, ERROR_CATEGORIES, MediaError, CDNHTTPS
@@ -97,22 +97,15 @@ class Broker:
         if method == 'status' and not args:
             return dict(self.status)
         if method == 'build' and not args:
-            return {'broker_build': 'media-tts-opt-in-20261009', 'optional_ret_with_valid_id': True,
+            return {'broker_build': 'message-query-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled, 'native_voice': False}
-        if method == 'read' and set(args) in (set(), {'after_seq'}, {'message_id'}):
-            after_seq = args.get('after_seq', 0)
-            if type(after_seq) is not int or after_seq < 0:
-                raise AdapterError('invalid_read_cursor')
+        if method in ('read', 'read_pending'):
+            validate_read_arguments(args, pending_only=method == 'read_pending')
             with self.lock:
                 adapter = self.adapter()
                 try:
-                    if 'message_id' in args:
-                        if not self.media_enabled or not isinstance(args['message_id'], str) or not 0 < len(args['message_id']) <= 128:
-                            raise AdapterError('invalid_read_message')
-                        messages = adapter.read_messages(message_id=args['message_id'])
-                    else:
-                        messages = adapter.read_messages(after_seq)
-                    return {'channel_id': CHANNEL, 'messages': messages}
+                    return {'channel_id': CHANNEL,
+                            **adapter.read_page(**args, pending_only=method == 'read_pending')}
                 finally:
                     adapter.close()
         if method == 'reply' and set(args) == {'message_id', 'text', 'idempotency_key'}:

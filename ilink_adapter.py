@@ -5,6 +5,7 @@ authorization require a separate reviewed implementation and consent checkpoint.
 """
 import base64
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -22,6 +23,24 @@ CLIENT_VERSION = str((2 << 16) | (4 << 8) | 9)
 BASE_INFO = {"channel_version": VERSION, "bot_agent": "DotWeixinPrototype/0.1.0"}
 FUTURE_EVENT = "wechat.message.created"
 FUTURE_TOOLS = ("wechat_read_messages", "wechat_reply_text")
+READ_PAGE_SIZE = 20
+REPLY_MAX_AGE = 3600
+
+
+def validate_read_arguments(arguments, *, pending_only=False):
+    allowed = {'after_seq', 'limit'} | (set() if pending_only else {'message_id'})
+    if not isinstance(arguments, dict) or set(arguments) - allowed:
+        raise AdapterError('invalid_read_arguments')
+    if 'message_id' in arguments:
+        value = arguments['message_id']
+        if not isinstance(value, str) or not 0 < len(value) <= 128:
+            raise AdapterError('invalid_read_message')
+        if 'after_seq' in arguments:
+            raise AdapterError('invalid_read_arguments')
+    if 'after_seq' in arguments and (type(arguments['after_seq']) is not int or arguments['after_seq'] < 0):
+        raise AdapterError('invalid_read_cursor')
+    if 'limit' in arguments and (type(arguments['limit']) is not int or not 1 <= arguments['limit'] <= READ_PAGE_SIZE):
+        raise AdapterError('invalid_read_limit')
 
 
 def valid_message_id(value):
@@ -103,6 +122,7 @@ class TextAdapter:
             received REAL, digest TEXT);
           CREATE TABLE IF NOT EXISTS replies(k TEXT PRIMARY KEY, message_id TEXT,
             text TEXT, client_id TEXT, state TEXT);
+          CREATE INDEX IF NOT EXISTS replies_message_id ON replies(message_id);
           CREATE TABLE IF NOT EXISTS reply_diagnostics(k TEXT PRIMARY KEY,
             time REAL, elapsed_ms INTEGER, category TEXT, http_status INTEGER);
         """)
@@ -219,10 +239,49 @@ class TextAdapter:
             return None
         return "wx_" + hashlib.sha256((self.session + ":" + str(mid)).encode()).hexdigest(), text, context
 
-    def read_messages(self, after_seq=0, limit=20):
-        return [{"message_id": row[0], "text": row[1], "session_id": self.session,
-                 "trust": "untrusted_external_data", "grants_permissions": False, "local_seq": row[2]}
-                for row in self.db.execute("SELECT id,text,rowid FROM messages WHERE rowid>? ORDER BY rowid LIMIT ?", (after_seq, limit))]
+    def read_messages(self, after_seq=0, limit=READ_PAGE_SIZE, message_id=None, *, pending_only=False):
+        return self.read_page(after_seq, limit, message_id, pending_only=pending_only)['messages']
+
+    def read_page(self, after_seq=0, limit=READ_PAGE_SIZE, message_id=None, *, pending_only=False):
+        arguments = {'limit': limit}
+        if message_id is None:
+            arguments['after_seq'] = after_seq
+        else:
+            if after_seq != 0:
+                raise AdapterError('invalid_read_arguments')
+            arguments['message_id'] = message_id
+        validate_read_arguments(arguments, pending_only=pending_only)
+        now = self.clock()
+        if message_id is None:
+            where, values = ['m.rowid > ?'], [after_seq]
+        else:
+            where, values = ['m.id = ?'], [message_id]
+        if pending_only:
+            where += ['m.received >= ?', 'm.received <= ?',
+                      'NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)']
+            values += [now - REPLY_MAX_AGE, now]
+        # State is evaluated in the same SELECT as the page. Reading never
+        # claims a message or moves the relay's independent cursor.
+        rows = self.db.execute('''SELECT m.id,m.text,m.rowid,m.received,
+            CASE
+              WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.state='api_accepted') THEN 'api_accepted'
+              WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.state='sending') THEN 'sending'
+              WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.state='unknown') THEN 'unknown'
+              WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.state='api_rejected') THEN 'api_rejected'
+              WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id) THEN 'unknown'
+              ELSE 'never_replied'
+            END
+            FROM messages m WHERE ''' + ' AND '.join(where) +
+            ' ORDER BY m.rowid LIMIT ?', (*values, limit + 1)).fetchall()
+        messages = [{"message_id": row[0], "text": row[1], "session_id": self.session,
+                     "trust": "untrusted_external_data", "grants_permissions": False, "local_seq": row[2],
+                     "received_at": datetime.fromtimestamp(row[3], timezone.utc).isoformat(),
+                     "reply_state": row[4],
+                     "reply_eligible": row[4] == 'never_replied' and 0 <= now - row[3] <= REPLY_MAX_AGE}
+                    for row in rows[:limit]]
+        return {'messages': messages, 'has_more': len(rows) > limit,
+                'next_after_seq': None if message_id is not None else
+                    (messages[-1]['local_seq'] if messages else after_seq)}
 
     def reply(self, message_id, text, idempotency_key):
         if not isinstance(text, str) or not text or len(text.encode()) > 2000:
@@ -237,7 +296,7 @@ class TextAdapter:
         row = self.db.execute("SELECT context,received FROM messages WHERE id=?", (message_id,)).fetchone()
         if row is None:
             raise AdapterError("unknown_message")
-        if self.clock() - row[1] > 3600:
+        if self.clock() - row[1] > REPLY_MAX_AGE:
             raise AdapterError("local_context_age_limit")
         if self.exchange is None:
             raise AdapterError("live_transport_not_implemented")

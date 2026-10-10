@@ -316,6 +316,7 @@ class MediaTests(unittest.TestCase):
         self.ingest(); msg = self.read()
         schemas = {t['name']: t for t in self.s.tools()['tools']}
         calls = [('wechat_read_messages', {}), ('wechat_read_messages', {'message_id': msg['message_id']}),
+                 ('wechat_read_pending_messages', {'limit': 1}),
                  ('wechat_read_status', {}), ('wechat_read_media', self.media_args()),
                  ('wechat_reply_media', self.reply_args()), ('wechat_forget_media', {'message_id': msg['message_id']})]
         for name, args in calls:
@@ -325,6 +326,7 @@ class MediaTests(unittest.TestCase):
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate({'message_id': msg['message_id'], 'after_seq': 0}, schemas['wechat_read_messages']['inputSchema'])
         self.assertEqual(self.tool('wechat_read_messages', {'after_seq': msg['local_seq']})['structuredContent']['messages'], [])
+        self.assertEqual(self.tool('wechat_read_pending_messages', {})['structuredContent']['messages'], [])
 
     def test_missing_payload_completion_failure_has_validation_stage(self):
         meta = {'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {}}
