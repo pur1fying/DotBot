@@ -25,7 +25,7 @@ from ilink_adapter import AdapterError, READ_PAGE_SIZE, validate_read_arguments
 
 FIXTURE_SECRET = "whsec_" + base64.b64encode(b"offline-test-fixture-key-32-bytes!").decode()
 VERSIONS = ["2026-07-28"]
-SERVER_INFO = {"name": "wechat-dot-synthetic-bridge", "version": "0.4.2"}
+SERVER_INFO = {"name": "wechat-dot-synthetic-bridge", "version": "0.4.3"}
 
 
 class RPCError(Exception):
@@ -55,8 +55,25 @@ class ReloadableDelivery:
     def __init__(self, path, factory=SafeHTTPS):
         self.path, self.factory = Path(path), factory
         self.offline = OfflineDelivery()
+        self._transport_lock = threading.Lock()
+        self._cached_transport = None
+        self._transport_key = None
 
     def transport(self):
+        # Re-read policy even on cache hits so revocation still takes effect on
+        # the next operation. Only the transport/resolver is reused.
+        with self._transport_lock:
+            try:
+                return self._load_transport()
+            except (OSError, ValueError, TypeError):
+                self._clear_transport()
+                raise CallbackError("invalid_outbound_policy") from None
+
+    def _clear_transport(self):
+        self._cached_transport = None
+        self._transport_key = None
+
+    def _load_transport(self):
         try:
             fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as f:
@@ -79,17 +96,24 @@ class ReloadableDelivery:
                 if not isinstance(host, str) or not host or len(host) > 253 or host != host.lower() or host.endswith(".") or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789.-" for c in host):
                     raise ValueError()
             if not policy["enabled"]:
+                self._clear_transport()
                 return self.offline
             if not hosts:
                 raise ValueError()
-            if transport == "clash_cloudflare_doh":
-                from proxy_outbound import proxy_transport
-                return proxy_transport(hosts, enabled=True)
-            return self.factory(hosts, enabled=True)
+            policy_key = (transport, tuple(sorted(set(hosts))))
+            if self._transport_key != policy_key:
+                self._clear_transport()
+                if transport == "clash_cloudflare_doh":
+                    from proxy_outbound import proxy_transport
+                    candidate = proxy_transport(hosts, enabled=True)
+                else:
+                    candidate = self.factory(hosts, enabled=True)
+                self._cached_transport = candidate
+                self._transport_key = policy_key
+            return self._cached_transport
         except FileNotFoundError:
+            self._clear_transport()
             return self.offline
-        except (OSError, ValueError, TypeError):
-            raise CallbackError("invalid_outbound_policy") from None
 
     def validate_url(self, url):
         return self.transport().validate_url(url)

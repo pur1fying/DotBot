@@ -152,6 +152,44 @@ class PersistentTests(unittest.TestCase):
         path.unlink(); path.symlink_to(self.path)
         with self.assertRaises(CallbackError): delivery.transport()
 
+    def test_reloadable_transport_reuses_resolver_but_rechecks_policy(self):
+        path = Path(self.tmp.name) / 'outbound.json'
+        enabled = {'enabled': True, 'callback_hosts': ['connectors.api.openai.com'],
+                   'transport': 'clash_cloudflare_doh'}
+        def policy(data):
+            path.write_text(json.dumps(data)); path.chmod(0o600)
+        delivery = ReloadableDelivery(path)
+        policy(enabled)
+        first = delivery.transport()
+        delivery.validate_url('https://connectors.api.openai.com/test')
+        self.assertIs(delivery.transport(), first)
+        with patch.object(first, 'post', return_value=(200, {})) as post:
+            delivery.post('https://connectors.api.openai.com/test', b'x', {})
+            post.assert_called_once()
+        # Each revoked/missing/invalid policy discards the old resolver cache.
+        for state in ('disabled', 'missing', 'invalid', 'shared', 'symlink'):
+            with self.subTest(state=state):
+                if state == 'disabled': policy({**enabled, 'enabled': False})
+                elif state == 'missing': path.unlink()
+                elif state == 'invalid': path.write_text('{')
+                elif state == 'shared': path.chmod(0o644)
+                else:
+                    path.unlink(); path.symlink_to(self.path)
+                if state in ('disabled', 'missing'):
+                    self.assertIs(delivery.transport(), delivery.offline)
+                else:
+                    with self.assertRaises(CallbackError): delivery.transport()
+                path.unlink(missing_ok=True)
+                policy(enabled)
+                replacement = delivery.transport()
+                self.assertIsNot(replacement, first)
+                first = replacement
+        policy({**enabled, 'transport': 'direct'})
+        direct = delivery.transport()
+        self.assertIsNot(direct, first)
+        policy({**enabled, 'transport': 'direct', 'callback_hosts': ['other.example.test']})
+        self.assertIsNot(delivery.transport(), direct)
+
     def test_diagnostics_policy_redacted_and_persistent(self):
         params = {**self.params, "delivery": {"mode": "webhook", "url": "https://callback.example.test/private-path?token=NEVER_LOG", "secret": "whsec_NEVER_LOG"}}
         response = process(self.service, {"jsonrpc": "2.0", "id": 9, "method": "events/subscribe", "params": params})

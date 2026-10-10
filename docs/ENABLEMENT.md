@@ -6,7 +6,7 @@
 2. 媒体新增网络为 `novac2c.cdn.weixin.qq.com:443`：GET `/c2c/download`、POST `/c2c/upload`；原 iLink API 新增 POST `/ilink/bot/getuploadurl`。既有 Cloudflare DoH/TLS bootstrap、localhost 代理、原 Tunnel/callback 范围沿用，不新增媒体接收方。MCP 媒体块经原 Tunnel 到同一个 dot；只有附件 ID 进入事件。
 3. 批准后，没有运行 broker 时用 `python3 -B start_wechat_broker.py --media`；已运行时用 `python3 -B restart_wechat_broker.py --media`。restart 检查实际锁持有者、发送/生成在途状态，拒绝强制 kill。TTS 随媒体模式配置，需本机已有库及 cmn 数据；status 的 local_tts_configured 不代表动态库可用，真实生成测试才验证。
 4. SILK 尚未安装/验证，不加 `--silk-node`。依赖批准并用非私人 SILK 样本实测 helper 后，才选择本地绝对 Node 路径：`--media --silk-node '<Node 绝对路径>'`。解码不等于 ASR 或 dot 听懂。
-5. 批准后让**同一个原 Tunnel**改用项目相对模板 `/bin/sh launch_mcp_media.sh`，保留实际原 `--db` / policy 参数。原文字模板为 `launch_mcp.sh`；两者清空环境，用 `/usr/bin/python3`。刷新同一 Plugin 的工具及事件 schema，核对版本 0.4.2、12 个工具/2 事件、四个媒体/TTS 工具及 reply source 二选一。文字模式为 8 个工具，包括独立可用的待回复查询。`ttlMs=0` 不证明在线缓存已刷新。
+5. 批准后让**同一个原 Tunnel**改用项目相对模板 `/bin/sh launch_mcp_media.sh`，保留实际原 `--db` / policy 参数。原文字模板为 `launch_mcp.sh`；两者清空环境，用 `/usr/bin/python3`。刷新同一 Plugin 的工具及事件 schema，核对版本 0.4.3、12 个工具/2 事件、四个媒体/TTS 工具及 reply source 二选一。文字模式为 8 个工具，包括独立可用的待回复查询。`ttlMs=0` 不证明在线缓存已刷新。
 6. 经授权更新原 dot 的既有事件处理指令，保留所有原 trigger。使用事件实际 data.message_id 精确读取；payload 缺失则调用 wechat_read_pending_messages 并按 next_after_seq 分页，只处理返回的实际消息。查询规则见 [消息查询接口](MESSAGE_QUERIES.md)。附件须 read_media 后再理解；明确 decoder_required/平台音频不支持。只回复原 owner 对应实际消息，unknown 不重试；生成/暂存不自动发送。
 
 最小真实测试由用户主动在**同一 ClawBot 对话**发起，每次使用新收到的实际 ID，不操作其他会话：

@@ -1,6 +1,7 @@
 """Pinned-IP HTTPS callback transport. Default disabled; no proxy or redirects.
 
-Resolve on every attempt; reject the entire DNS answer if any IP is non-public.
+Consult the resolver on every attempt; it may reuse unexpired DNS answers.
+Reject the entire DNS answer if any IP is non-public.
 Connect to a validated numeric IP, preserving original hostname for TLS and Host.
 Test seams inject DNS and HTTP connections; tests never make internet requests.
 """

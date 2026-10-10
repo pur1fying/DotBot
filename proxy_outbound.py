@@ -10,6 +10,8 @@ import ipaddress
 import json
 import socket
 import ssl
+import threading
+import time
 from urllib.parse import urlencode
 from outbound import CallbackError, SafeHTTPS
 
@@ -17,6 +19,7 @@ CALLBACK_HOST = "connectors.api.openai.com"
 DOH_HOST = "cloudflare-dns.com"
 DOH_BOOTSTRAP = "1.1.1.1"
 PROXY = ("127.0.0.1", 7890)
+MAX_CACHE_TTL = 300
 
 
 def public_ip(value):
@@ -104,15 +107,36 @@ def parse_answers(data, query_type, query_host=CALLBACK_HOST):
 
 
 class CloudflareResolver:
-    def __init__(self, connection_factory=ProxyPinnedHTTPSConnection, query_host=CALLBACK_HOST):
+    """Cache validated positive answers per family, honoring CNAME TTL and Age.
+
+    Empty answers and failures are not cached. The lock coalesces concurrent
+    misses (the broker can poll and send at the same time). No stale fallback.
+    """
+    def __init__(self, connection_factory=ProxyPinnedHTTPSConnection, query_host=CALLBACK_HOST,
+                 now=time.monotonic):
         self.connection_factory = connection_factory
         self.query_host = query_host
+        self.now = now
+        self._cache = {}
+        self._lock = threading.Lock()
 
     def __call__(self, host, port, type):
         if host != self.query_host or port != 443 or type != socket.SOCK_STREAM:
             raise CallbackError("doh_query_forbidden")
-        ips = []
+        with self._lock:
+            ips = self._resolve()
+        return [(socket.AF_INET if ipaddress.ip_address(ip).version == 4 else socket.AF_INET6,
+                 socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in dict.fromkeys(ips)]
+
+    def _resolve(self):
+        ips, refreshed = [], {}
         for query_type in (1, 28):
+            started = self.now()
+            cached = self._cache.get(query_type)
+            if cached is not None and started < cached[0]:
+                ips.extend(cached[1])
+                continue
+            self._cache.pop(query_type, None)
             conn = self.connection_factory(DOH_HOST, DOH_BOOTSTRAP, 10)
             try:
                 path = "/dns-query?" + urlencode({"name": self.query_host, "type": query_type})
@@ -127,7 +151,18 @@ class CloudflareResolver:
                     data = json.loads(raw)
                 except (ValueError, UnicodeError):
                     raise CallbackError("doh_invalid_response") from None
-                ips.extend(parse_answers(data, query_type, self.query_host))
+                answers = parse_answers(data, query_type, self.query_host)
+                ips.extend(answers)
+                # Include every CNAME in the TTL bound. Starting the deadline
+                # before the request also subtracts time spent fetching it.
+                ttls = [record.get("TTL") for record in data.get("Answer", [])]
+                age = response.getheader("Age", "0")
+                if (answers and ttls and
+                        all(type(ttl) is int and 0 <= ttl < 2**31 for ttl in ttls) and
+                        isinstance(age, str) and age.isascii() and age.isdecimal() and len(age) <= 10):
+                    expires = started + max(0, min(MAX_CACHE_TTL, min(ttls) - int(age)))
+                    if self.now() < expires:
+                        refreshed[query_type] = (expires, tuple(answers))
             except ssl.SSLCertVerificationError:
                 raise CallbackError("tls_certificate_failed") from None
             except ssl.SSLError:
@@ -140,8 +175,9 @@ class CloudflareResolver:
                 conn.close()
         if not ips:
             raise CallbackError("doh_no_address")
-        return [(socket.AF_INET if ipaddress.ip_address(ip).version == 4 else socket.AF_INET6,
-                 socket.SOCK_STREAM, 6, "", (ip, 443)) for ip in dict.fromkeys(ips)]
+        # Only publish new cache entries after both families validated.
+        self._cache.update(refreshed)
+        return ips
 
 
 def proxy_transport(hosts, enabled=False):
