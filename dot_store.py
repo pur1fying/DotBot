@@ -336,7 +336,6 @@ class DotStore:
             return {'accepted': True, 'admission': True, 'message_id': row[0]}
         if (message.get('self') is not False or message.get('role') != 'user' or
                 message.get('senderAeonId') != binding.get('dot_id') or
-                message.get('turnTrigger') != 'chatgpt_messaging' or
                 message.get('replyRootMessageId') != binding['reply_anchor_message_id']):
             return {'accepted': False}
         parent = message.get('replyToMessageId')

@@ -30,8 +30,8 @@ class Gateway:
         self.history_dirty = True
         self.last_inbox_seq = 0
 
-    async def read_history(self, *, drain=False):
-        cursor = await self.broker('dot_room_cursor')
+    async def read_history(self, *, drain=False, start_cursor=None):
+        cursor = start_cursor or await self.broker('dot_room_cursor')
         for _ in range(100):
             page = await self.room.invoke('messages', {
                 'replyRootMessageId': self.binding['reply_anchor_message_id'],
@@ -54,6 +54,17 @@ class Gateway:
                     await self.drain()
                 return
         raise DotError('dot_history_backlog')
+
+    async def reconcile_pending(self, *, drain=False):
+        jobs = (await self.broker('dot_reconcile_jobs'))['jobs']
+        waiting = [job for job in jobs if job.get('room_message_id') and job['state'] in
+                   ('waiting_reply', 'submission_unknown', 'requires_user_action')]
+        if waiting:
+            # A previously filtered message can sit behind the global cursor.
+            # Re-read from the earliest outstanding owned input; item IDs keep
+            # already accepted deliveries idempotent.
+            first = min(waiting, key=lambda job: job['received_at'])
+            await self.read_history(drain=drain, start_cursor=first['room_message_id'])
 
     async def drain(self):
         while True:
@@ -170,6 +181,7 @@ async def serve(socket_path, directory, *, port=9229, target_id=None):
                 gateway = Gateway(broker, room, binding)
                 status = await broker('dot_status')
                 gateway.last_inbox_seq = status.get('cutover_seq') or 0
+                await gateway.reconcile_pending(drain=True)
                 await gateway.serve_connected(directory)
             except (DotError, BrokerError) as error:
                 category = error.category

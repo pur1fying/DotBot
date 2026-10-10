@@ -123,12 +123,32 @@ class RoomGatewayTests(unittest.IsolatedAsyncioTestCase):
         job = self.call('dot_next'); self.call('dot_submitting', message_id=job['message_id'])
         self.call('dot_room_message', message=self.own(job))
         for message in [self.reply(roomId='foreign'), self.reply(senderAeonId='other'),
-                        self.reply(role='assistant'), self.reply(turnTrigger='background'),
+                        self.reply(role='assistant'),
                         self.reply(replyRootMessageId='other'), self.reply(parent='unknown')]:
             self.assertFalse(self.call('dot_room_message', message=message)['accepted'])
         self.clock += 3601
         self.assertFalse(self.call('dot_room_message', message=self.reply())['accepted'])
         self.assertIsNone(self.call('dot_drain_one'))
+
+    async def test_persistent_mode_public_reply_is_backfilled_behind_cursor(self):
+        self.call('dot_activate'); self.add(1)
+        job = self.call('dot_next'); self.call('dot_submitting', message_id=job['message_id'])
+        self.call('dot_room_message', message=self.own(job))
+        self.call('dot_room_set_cursor', cursor='already-passed-reply')
+        message = self.reply(iid='persistent-reply', text='5', turnTrigger='persistent_mode')
+        queries = []
+        class Room:
+            async def invoke(self, operation, args=None):
+                queries.append(args)
+                return {'messages': [message], 'after': None}
+        gateway = Gateway(self.rpc, Room(), BINDING)
+        await gateway.reconcile_pending(drain=True)
+        self.assertEqual(queries[0]['after'], 'incoming')
+        self.assertEqual(self.call('dot_status')['jobs'], {'api_accepted': 1})
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]['msg']['item_list'][0]['text_item']['text'], '5')
+        await gateway.drain()
+        self.assertEqual(len(self.sent), 1)
 
     async def test_visible_confirmation_options_are_text_only_and_not_approved(self):
         self.call('dot_activate'); self.add(1)

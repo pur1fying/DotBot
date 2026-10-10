@@ -74,7 +74,9 @@ async def operations(args):
         room = DesktopRoomClient(port=args.debug_port, target_id=args.desktop_target)
         try:
             await room.open(binding)
-            await Gateway(broker, room, binding).read_history()
+            gateway = Gateway(broker, room, binding)
+            await gateway.reconcile_pending()
+            await gateway.read_history()
             return await broker('dot_status')
         finally:
             await room.close()
