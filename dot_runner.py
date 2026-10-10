@@ -126,7 +126,9 @@ class Gateway:
                     await self.read_history(drain=True)
                 await self.drain()
                 await self.submit()
-                write_health(directory, 'ready', transport='desktop_native_room')
+                status = await self.room.invoke('status')
+                write_health(directory, 'ready' if status.get('subscribed') else 'reconnecting',
+                             transport='desktop_native_room', subscribed=bool(status.get('subscribed')))
                 wake = asyncio.create_task(self.wake.wait())
                 try:
                     await asyncio.wait([wake, *tasks], timeout=30, return_when=asyncio.FIRST_COMPLETED)
@@ -152,11 +154,14 @@ async def serve(socket_path, directory, *, port=9229, target_id=None):
             raise DotError('dot_gateway_already_running') from None
         async def broker(method, args=None):
             return await asyncio.to_thread(call, method, args, socket_path)
-        await broker('dot_recover')
+        recovered = False
         delay = 1
         while True:
             room = DesktopRoomClient(port=port, target_id=target_id)
             try:
+                if not recovered:
+                    await broker('dot_recover')
+                    recovered = True
                 binding = await broker('dot_binding')
                 if not binding or binding.get('transport') != 'desktop_native_room' or not binding.get('protocol_verified'):
                     raise DotError('dot_protocol_unverified')

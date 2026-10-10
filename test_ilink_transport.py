@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import socket
 from ilink_transport import ILinkHTTPS
 from ilink_login_ui import save_new_binding
 from ilink_adapter import Binding, API_HOST
@@ -101,6 +102,31 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(len(created), 1)
         self.assertEqual(transport.connections, {})
+
+    def test_idle_or_peer_closed_connection_is_replaced_before_send(self):
+        created, peers = [], []
+        clock = [100.0]
+        class Conn:
+            status = 200; will_close = False
+            def __init__(self):
+                self.sock, peer = socket.socketpair(); peers.append(peer); self.requests = 0
+            def request(self, *args, **kwargs): self.requests += 1
+            def getresponse(self): return self
+            def read(self, _): return b'{"ret":0}'
+            def close(self): self.sock.close()
+        def factory(*_): value = Conn(); created.append(value); return value
+        transport = ILinkHTTPS(resolver=self.t.resolver, factory=factory, now=lambda: clock[0])
+        try:
+            transport.exchange('/ilink/bot/sendmessage', {}, {})
+            clock[0] += 16
+            transport.exchange('/ilink/bot/sendmessage', {}, {})
+            peers[-1].close()
+            transport.exchange('/ilink/bot/sendmessage', {}, {})
+            self.assertEqual(len(created), 3)
+            self.assertEqual([c.requests for c in created], [1, 1, 1])
+        finally:
+            transport.close()
+            for peer in peers: peer.close()
 
 
 if __name__ == '__main__':

@@ -3,6 +3,8 @@ import json
 import socket
 import ssl
 import threading
+import time
+import select
 from outbound import CallbackError, destination
 from proxy_outbound import CloudflareResolver, ProxyPinnedHTTPSConnection, DOH_HOST
 from ilink_adapter import API_HOST
@@ -13,10 +15,12 @@ def connection(host, address, timeout):
 
 
 class ILinkHTTPS:
-    def __init__(self, resolver=None, factory=connection):
+    def __init__(self, resolver=None, factory=connection, now=time.monotonic):
         self.resolver = resolver or CloudflareResolver(query_host=API_HOST)
         self.factory = factory
         self.connections = {}
+        self.last_used = {}
+        self.now = now
         self.locks = {'poll': threading.Lock(), 'send': threading.Lock()}
 
     def request(self, method, path, headers, body=None):
@@ -36,6 +40,20 @@ class ILinkHTTPS:
 
     def _exchange(self, slot, host, method, target, raw, headers):
         conn = self.connections.get(slot)
+        if conn is not None:
+            sock = getattr(conn, 'sock', False)
+            idle = self.now() - self.last_used.get(slot, 0)
+            try:
+                # An idle HTTP connection has no application data to receive.
+                # Readability may be EOF/TLS close; discard before any new write.
+                readable = sock is not False and (sock is None or bool(select.select([sock], [], [], 0)[0]))
+            except (OSError, ValueError):
+                readable = True
+            if idle >= 15 or readable:
+                conn.close()
+                self.connections.pop(slot, None)
+                self.last_used.pop(slot, None)
+                conn = None
         if conn is None:
             addresses = self.resolver(host, 443, type=socket.SOCK_STREAM)
             from proxy_outbound import public_ip
@@ -72,14 +90,17 @@ class ILinkHTTPS:
         finally:
             if reusable:
                 self.connections[slot] = conn
+                self.last_used[slot] = self.now()
             else:
                 self.connections.pop(slot, None)
+                self.last_used.pop(slot, None)
                 conn.close()
 
     def close(self):
         for slot, lock in self.locks.items():
             with lock:
                 conn = self.connections.pop(slot, None)
+                self.last_used.pop(slot, None)
                 if conn is not None:
                     conn.close()
 
