@@ -213,6 +213,8 @@ class DotStore:
         if not row:
             return None
         job = dict(zip([column[0] for column in cursor.description], row))
+        from wechat_quotes import read
+        job['quotes'] = read(self.db, message_id)
         job['images'] = []
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media'").fetchone():
             job['images'] = [dict(zip(('media_id', 'state', 'file_id'), values)) for values in

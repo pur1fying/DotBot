@@ -119,6 +119,8 @@ class MediaAdapter(TextAdapter):
                     rejected += 1
                     continue
                 mid, text, context, refs = parsed
+                from wechat_quotes import capture
+                capture(self.db, mid, msg, text)
                 # Keep the old digest for pure text, allowing upgrade without replay.
                 values = [text, context] + ([refs] if refs else [])
                 digest = hashlib.sha256(json.dumps(values).encode()).hexdigest()
@@ -360,6 +362,10 @@ class MediaAdapter(TextAdapter):
                 'from_user_id': '', 'to_user_id': self.binding.user_id, 'client_id': client_id,
                 'message_type': 2, 'message_state': 2, 'context_token': row[0], 'item_list': [item]}})
             state, category = acknowledgement(ack)
+            if state == 'api_accepted':
+                from wechat_quotes import record_sent
+                with self.db:
+                    record_sent(self.db, ack, idempotency_key, '[图片]' if kind == 'image' else '[音频文件]')
             http_status = 200
         except AdapterError as e:
             category, http_status = getattr(e, 'category', 'media_exchange_failed'), getattr(e, 'http_status', None)

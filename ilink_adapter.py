@@ -130,6 +130,8 @@ class TextAdapter:
         if 'http_status' not in {r[1] for r in self.db.execute('PRAGMA table_info(reply_diagnostics)')}:
             self.db.execute('ALTER TABLE reply_diagnostics ADD COLUMN http_status INTEGER')
         initialize_dot_store(self.db)
+        from wechat_quotes import initialize
+        initialize(self.db)
         self.dot = DotStore(self.db, self.clock)
         self.session = hashlib.sha256((binding.bot_id + "\0" + binding.user_id).encode()).hexdigest()
         old = self._get("session")
@@ -202,6 +204,8 @@ class TextAdapter:
                     rejected += 1
                     continue
                 mid, text, context = parsed
+                from wechat_quotes import capture
+                capture(self.db, mid, msg, text)
                 digest = hashlib.sha256(json.dumps([text, context]).encode()).hexdigest()
                 old = self.db.execute("SELECT digest FROM messages WHERE id=?", (mid,)).fetchone()
                 if old:
@@ -324,6 +328,10 @@ class TextAdapter:
                 "client_id": client_id, "message_type": 2, "message_state": 2,
                 "context_token": row[0], "item_list": [{"type": 1, "text_item": {"text": text}}]}})
             state, category = acknowledgement(result)
+            if state == 'api_accepted':
+                from wechat_quotes import record_sent
+                with self.db:
+                    record_sent(self.db, result, idempotency_key, text)
             http_status = 200  # ILinkHTTPS only returns a parsed object for HTTP200.
         except AdapterError as error:
             category = getattr(error, 'category', 'exchange_failed')

@@ -105,7 +105,7 @@ class Broker:
             return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled,
                     'images_enabled': self.images_enabled, 'image_files_enabled': self.images_enabled,
-                    'native_voice': False}
+                    'quote_metadata_enabled': True, 'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
             if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
                 raise AdapterError('invalid_wait_arguments')
@@ -195,6 +195,7 @@ class Broker:
                 self.changed.wait(remaining)
 
     def dot_call(self, adapter, method, args):
+        from wechat_quotes import read as read_quotes
         store = adapter.dot
         operations = {
             'dot_status': (set(), store.status),
@@ -213,6 +214,7 @@ class Broker:
             'dot_input_image_begin': ({'message_id', 'media_id'}, store.input_image_begin),
             'dot_input_image_done': ({'message_id', 'media_id', 'file_id'}, store.input_image_done),
             'dot_output_next': (set(), store.next_part),
+            'dot_read_quotes': ({'message_id'}, lambda message_id: read_quotes(adapter.db, message_id)),
             'dot_room_message': ({'message'}, store.room_message),
             'dot_room_reconcile': (set(), store.reconcile_room_inbox),
             'dot_room_cursor': (set(), store.room_cursor),
