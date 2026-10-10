@@ -12,7 +12,7 @@
 
 `reply_state` 为 `never_replied`、`sending`、`unknown`、`api_rejected` 或 `api_accepted`。有多次尝试时，任一接受记录使汇总状态为 `api_accepted`；否则依次优先显示 `sending`、`unknown`、`api_rejected`。接受不代表手机送达。`reply_eligible` 仅在从未尝试且收信时间位于当前一小时回复窗口时为 true。
 
-待回复查询排除所有已有回复尝试的消息，包括失败和结果不明的尝试，也排除过期及未来时间的消息。它不会把 `unknown`／`sending` 自动当作可重发项。读取不占用消息、不标为已处理，也不会移动事件转接游标。
+待回复查询排除所有已有回复尝试的消息，包括失败和结果不明的尝试，也排除过期及未来时间的消息。分配给直连网关的消息也不出现在此查询中，其 `reply_eligible` 为 false。它不会把 `unknown`／`sending` 自动当作可重发项。读取不占用消息、不标为已处理，也不会移动事件转接游标。
 
 结果包含 `has_more` 和 `next_after_seq`。分页查询的 `next_after_seq` 是最后返回的序号；空页保持输入游标，可用于后续增量读取。精确 ID 查询的该字段为 null。
 

@@ -2,6 +2,7 @@
 import json
 import socket
 import ssl
+import threading
 from outbound import CallbackError, destination
 from proxy_outbound import CloudflareResolver, ProxyPinnedHTTPSConnection, DOH_HOST
 from ilink_adapter import API_HOST
@@ -15,6 +16,8 @@ class ILinkHTTPS:
     def __init__(self, resolver=None, factory=connection):
         self.resolver = resolver or CloudflareResolver(query_host=API_HOST)
         self.factory = factory
+        self.connections = {}
+        self.locks = {'poll': threading.Lock(), 'send': threading.Lock()}
 
     def request(self, method, path, headers, body=None):
         if method not in ('GET', 'POST'):
@@ -27,12 +30,20 @@ class ILinkHTTPS:
         raw = None if body is None else json.dumps(body, ensure_ascii=False).encode()
         if raw is not None and len(raw) > 262144:
             raise CallbackError('payload_too_large')
-        addresses = self.resolver(host, 443, type=socket.SOCK_STREAM)
-        from proxy_outbound import public_ip
-        ips = [str(public_ip(entry[4][0])) for entry in addresses]
-        if not ips:
-            raise CallbackError('doh_no_address')
-        conn = self.factory(host, ips[0], 40)
+        slot = 'poll' if target.split('?')[0] == '/ilink/bot/getupdates' else 'send'
+        with self.locks[slot]:
+            return self._exchange(slot, host, method, target, raw, headers)
+
+    def _exchange(self, slot, host, method, target, raw, headers):
+        conn = self.connections.get(slot)
+        if conn is None:
+            addresses = self.resolver(host, 443, type=socket.SOCK_STREAM)
+            from proxy_outbound import public_ip
+            ips = [str(public_ip(entry[4][0])) for entry in addresses]
+            if not ips:
+                raise CallbackError('doh_no_address')
+            conn = self.factory(host, ips[0], 40)
+        reusable = False
         try:
             conn.request(method, target, body=raw, headers=dict(headers, Host=host))
             response = conn.getresponse()
@@ -46,6 +57,7 @@ class ILinkHTTPS:
             result = json.loads(data)
             if not isinstance(result, dict):
                 raise CallbackError('invalid_response')
+            reusable = not getattr(response, 'will_close', True)
             return result
         except CallbackError:
             raise
@@ -58,7 +70,18 @@ class ILinkHTTPS:
         except Exception:
             raise CallbackError('api_exchange_failed') from None
         finally:
-            conn.close()
+            if reusable:
+                self.connections[slot] = conn
+            else:
+                self.connections.pop(slot, None)
+                conn.close()
+
+    def close(self):
+        for slot, lock in self.locks.items():
+            with lock:
+                conn = self.connections.pop(slot, None)
+                if conn is not None:
+                    conn.close()
 
     def exchange(self, path, headers, body):
         return self.request('POST', path, headers, body)

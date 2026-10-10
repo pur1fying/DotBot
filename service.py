@@ -424,7 +424,7 @@ class PersistentService:
         self.db.execute("CREATE TABLE IF NOT EXISTS wechat_cursor (id INTEGER PRIMARY KEY, seq INTEGER)")
         row = self.db.execute("SELECT seq FROM wechat_cursor WHERE id=1").fetchone()
         after = row[0] if row else 0
-        result = self.wechat("read", {"after_seq": after})
+        result = self.wechat("read_relay", {"after_seq": after})
         for message in result["messages"]:
             mid = message["message_id"]
             data = {"channel_id": "wechat-owner", "message_id": mid, "text": message["text"], "session_id": message["session_id"], "trust": "untrusted_external_data"}
@@ -436,6 +436,10 @@ class PersistentService:
                 for (sid,) in self.db.execute("SELECT id FROM subscriptions WHERE channel='wechat-owner' AND expiry>?", (self.now(),)).fetchall():
                     self.db.execute("INSERT OR IGNORE INTO deliveries(subscription_id,message_id,state) VALUES (?,?,'pending')", (sid, mid))
                 self.db.execute("INSERT OR REPLACE INTO wechat_cursor VALUES (1,?)", (message["local_seq"],))
+        next_cursor = result.get('next_after_seq')
+        if type(next_cursor) is int and next_cursor > after:
+            with self.db:
+                self.db.execute('INSERT OR REPLACE INTO wechat_cursor VALUES (1,?)', (next_cursor,))
         return self.flush()
 
     def receive(self, message_id, text):

@@ -64,6 +64,44 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 save_new_binding(Binding('other', 'other', 'SYNTHETIC'), directory)
 
+    def test_reuses_separate_poll_and_send_connections_without_resolving_again(self):
+        created, resolved = [], []
+        class Conn:
+            status = 200
+            will_close = False
+            def __init__(self): self.closed = False
+            def request(self, *args, **kwargs): pass
+            def getresponse(self): return self
+            def read(self, _): return b'{"ret":0}'
+            def close(self): self.closed = True
+        def factory(*_):
+            value = Conn(); created.append(value); return value
+        def resolver(*_, **kw):
+            resolved.append(1); return [(2, 1, 6, '', ('1.1.1.2', 443))]
+        transport = ILinkHTTPS(resolver=resolver, factory=factory)
+        for _ in range(2):
+            transport.exchange('/ilink/bot/getupdates', {}, {})
+            transport.exchange('/ilink/bot/sendmessage', {}, {})
+        self.assertEqual(len(created), 2)
+        self.assertEqual(len(resolved), 2)
+        self.assertIsNot(transport.connections['poll'], transport.connections['send'])
+        transport.close()
+        self.assertTrue(all(c.closed for c in created))
+
+    def test_ambiguous_send_is_never_retried_on_a_new_connection(self):
+        attempts, created = [], []
+        class Conn:
+            def request(self, *_, **kw):
+                attempts.append(1)
+                raise ConnectionResetError('synthetic after write')
+            def close(self): pass
+        def factory(*_): created.append(1); return Conn()
+        transport = ILinkHTTPS(resolver=self.t.resolver, factory=factory)
+        with self.assertRaises(CallbackError): transport.exchange('/ilink/bot/sendmessage', {}, {})
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(transport.connections, {})
+
 
 if __name__ == '__main__':
     unittest.main()

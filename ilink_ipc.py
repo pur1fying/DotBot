@@ -45,5 +45,7 @@ def _call(method, arguments, path):
         response = json.loads(raw)
         if response.get('ok') is not True:
             category = response.get('error')
-            raise BrokerError(category if isinstance(category, str) and category in ERROR_CATEGORIES else 'broker_operation_rejected')
+            safe_dot = (isinstance(category, str) and category.startswith(('dot_', 'auth_', 'wechat_', 'webhook_', 'reply_window_'))
+                        and len(category) <= 100 and category.replace('_', '').isalnum())
+            raise BrokerError(category if isinstance(category, str) and (category in ERROR_CATEGORIES or safe_dot) else 'broker_operation_rejected')
         return response['result']

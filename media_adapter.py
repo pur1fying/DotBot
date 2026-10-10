@@ -113,6 +113,7 @@ class MediaAdapter(TextAdapter):
                     continue
                 received = self.clock()
                 self.db.execute('INSERT INTO messages VALUES (?,?,?,?,?)', (mid, text, context, received, digest))
+                self.dot.record_incoming(mid, received, force_webhook=bool(refs))
                 for index, kind, ref in refs:
                     aid = 'media_' + hashlib.sha256((mid + ':' + str(index)).encode()).hexdigest()
                     self.db.execute('INSERT INTO media VALUES (?,?,?,?,?,?,?,?)',

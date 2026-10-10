@@ -14,6 +14,7 @@ import struct
 import threading
 import time
 import argparse
+from dot_auth import DotError
 from ilink_adapter import Binding, TextAdapter, AdapterError, API_HOST, validate_read_arguments
 from ilink_transport import ILinkHTTPS
 from outbound import CallbackError
@@ -53,6 +54,7 @@ class Broker:
     def __init__(self, directory, binding, exchange, clock=time.time, *, media_enabled=False, media_transport=None, silk_decoder=None, tts=None):
         self.directory, self.binding, self.clock = directory, binding, clock
         self.lock = threading.Lock()
+        self.changed = threading.Condition()
         self.status = {'bound': True, 'owner_bound': True, 'poll_state': 'starting'}
         self.media_enabled, self.media_transport, self.silk_decoder = media_enabled, media_transport, silk_decoder
         self.tts = tts
@@ -97,15 +99,31 @@ class Broker:
         if method == 'status' and not args:
             return dict(self.status)
         if method == 'build' and not args:
-            return {'broker_build': 'message-query-20261010', 'optional_ret_with_valid_id': True,
+            return {'broker_build': 'dot-direct-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled, 'native_voice': False}
-        if method in ('read', 'read_pending'):
+        if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
+            if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
+                raise AdapterError('invalid_wait_arguments')
+            return self.wait_inbox(args['after_seq'], args['timeout_ms'])
+        if method.startswith('dot_'):
+            with self.lock:
+                adapter = self.adapter()
+                try:
+                    return self.dot_call(adapter, method, args)
+                finally:
+                    adapter.close()
+                    with self.changed:
+                        self.changed.notify_all()
+        if method in ('read', 'read_pending', 'read_relay'):
             validate_read_arguments(args, pending_only=method == 'read_pending')
             with self.lock:
                 adapter = self.adapter()
                 try:
-                    return {'channel_id': CHANNEL,
-                            **adapter.read_page(**args, pending_only=method == 'read_pending')}
+                    result = adapter.read_page(**args, pending_only=method == 'read_pending')
+                    if method == 'read_relay':
+                        result['messages'] = [m for m in result['messages']
+                                              if adapter.dot.route(m['message_id']) == 'webhook']
+                    return {'channel_id': CHANNEL, **result}
                 finally:
                     adapter.close()
         if method == 'reply' and set(args) == {'message_id', 'text', 'idempotency_key'}:
@@ -135,6 +153,60 @@ class Broker:
                     adapter.close()
         raise AdapterError('broker_method_forbidden')
 
+    def wait_inbox(self, after_seq, timeout_ms):
+        deadline = time.monotonic() + timeout_ms / 1000
+        with self.changed:
+            while True:
+                adapter = self.adapter()
+                try:
+                    seq = adapter.db.execute('SELECT COALESCE(MAX(rowid),0) FROM messages').fetchone()[0]
+                finally:
+                    adapter.close()
+                remaining = deadline - time.monotonic()
+                if seq > after_seq or remaining <= 0:
+                    return {'local_seq': seq}
+                # No send lock or SQLite transaction is held while waiting.
+                self.changed.wait(remaining)
+
+    def dot_call(self, adapter, method, args):
+        store = adapter.dot
+        operations = {
+            'dot_status': (set(), store.status),
+            'dot_binding': (set(), lambda: store.binding),
+            'dot_bind': ({'binding'}, store.bind),
+            'dot_activate': (set(), store.activate),
+            'dot_rollback': (set(), store.rollback),
+            'dot_next': (set(), store.next_job),
+            'dot_submitting': ({'message_id'}, store.submitting),
+            'dot_submitted': ({'message_id', 'turn_id', 'written_at', 'error'}, store.submitted),
+            'dot_mark': ({'message_id', 'state', 'category'}, store.mark),
+            'dot_item': ({'thread_id', 'item', 'completed'}, store.accept_item),
+        }
+        if method in operations:
+            fields, operation = operations[method]
+            if set(args) != fields:
+                raise DotError('dot_invalid_arguments')
+            return operation(**args)
+        if method == 'dot_drain_one' and not args:
+            if self.status['poll_state'] == 'session_paused':
+                raise DotError('wechat_session_paused')
+            part = store.next_part()
+            if part is None:
+                return None
+            store.begin_part(part['item_id'], part['part'])
+            try:
+                result = adapter.reply(part['message_id'], part['text'], part['idempotency_key'], _route='direct')
+                state = result['state']
+            except Exception:
+                state = 'unknown'
+            store.finish_part(part['item_id'], part['part'], state)
+            return {key: part[key] for key in ('message_id', 'item_id', 'part')} | {'state': state}
+        if method == 'dot_reconcile_jobs' and not args:
+            store.expire()
+            rows = adapter.db.execute("SELECT message_id FROM dot_jobs WHERE state NOT IN ('expired','rolled_back','failed') ORDER BY received_at").fetchall()
+            return {'jobs': [store.job(row[0]) for row in rows]}
+        raise DotError('dot_method_forbidden')
+
     def poll_once(self):
         # Do not hold send lock during 35-second long poll; adapter has its own
         # SQLite connection. Writes are SQLite transactions, never shared cursor.
@@ -142,6 +214,9 @@ class Broker:
         try:
             result = adapter.poll()
             self.status['poll_state'] = result.get('state', 'ready')
+            if result.get('accepted', 0):
+                with self.changed:
+                    self.changed.notify_all()
             return result
         finally:
             adapter.close()
@@ -170,7 +245,7 @@ class Handler(socketserver.StreamRequestHandler):
             output = {'ok': True, 'result': result}
         except Exception as e:
             # Never serialize request, server response, exception or traceback.
-            category = str(e) if isinstance(e, MediaError) and str(e) in ERROR_CATEGORIES else 'broker_operation_rejected'
+            category = e.category if isinstance(e, DotError) else (str(e) if isinstance(e, MediaError) and str(e) in ERROR_CATEGORIES else 'broker_operation_rejected')
             output = {'ok': False, 'error': category}
         self.wfile.write(json.dumps(output, ensure_ascii=False).encode() + b'\n')
 
@@ -207,10 +282,17 @@ def main():
     server.broker = broker
     stop = threading.Event()
     def poller():
+        empty_delay = 0.1
         while not stop.is_set():
             try:
+                started = time.monotonic()
                 result = broker.poll_once()
-                delay = 60 if result.get('state') == 'session_paused' else 1
+                if result.get('state') == 'session_paused':
+                    delay = 60
+                elif result.get('accepted', 0) or time.monotonic() - started >= 1:
+                    delay, empty_delay = 0, 0.1
+                else:
+                    delay, empty_delay = empty_delay, min(1, empty_delay * 2)
             except Exception as error:
                 broker.status['poll_state'] = 'poll_failed'
                 if 'error_category' not in broker.status:

@@ -16,6 +16,7 @@ import stat
 import time
 from urllib.parse import urlencode, urlsplit
 from outbound import CallbackError
+from dot_store import DotStore, initialize as initialize_dot_store
 
 API_HOST = "ilinkai.weixin.qq.com"
 VERSION = "2.4.9"  # Official package metadata reviewed 2026-09-30; not service permission.
@@ -128,6 +129,8 @@ class TextAdapter:
         """)
         if 'http_status' not in {r[1] for r in self.db.execute('PRAGMA table_info(reply_diagnostics)')}:
             self.db.execute('ALTER TABLE reply_diagnostics ADD COLUMN http_status INTEGER')
+        initialize_dot_store(self.db)
+        self.dot = DotStore(self.db, self.clock)
         self.session = hashlib.sha256((binding.bot_id + "\0" + binding.user_id).encode()).hexdigest()
         old = self._get("session")
         if old is not None and old != self.session:
@@ -137,6 +140,8 @@ class TextAdapter:
             self._set("session", self.session)
             if recover_sending:
                 self.db.execute("UPDATE replies SET state='unknown' WHERE state='sending'")
+        if recover_sending:
+            self.dot.recover()
 
     def close(self):
         self.db.close()
@@ -204,8 +209,10 @@ class TextAdapter:
                         raise AdapterError("message_id_conflict")
                     duplicates += 1
                     continue
+                received = self.clock()
                 self.db.execute("INSERT INTO messages VALUES (?,?,?,?,?)",
-                                (mid, text, context, self.clock(), digest))
+                                (mid, text, context, received, digest))
+                self.dot.record_incoming(mid, received)
                 accepted += 1
             if cursor:
                 self._set("cursor", cursor)
@@ -258,7 +265,8 @@ class TextAdapter:
             where, values = ['m.id = ?'], [message_id]
         if pending_only:
             where += ['m.received >= ?', 'm.received <= ?',
-                      'NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)']
+                      'NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)',
+                      "NOT EXISTS (SELECT 1 FROM bridge_routes br WHERE br.message_id=m.id AND br.route='direct')"]
             values += [now - REPLY_MAX_AGE, now]
         # State is evaluated in the same SELECT as the page. Reading never
         # claims a message or moves the relay's independent cursor.
@@ -270,20 +278,23 @@ class TextAdapter:
               WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.state='api_rejected') THEN 'api_rejected'
               WHEN EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id) THEN 'unknown'
               ELSE 'never_replied'
-            END
+            END,
+            EXISTS(SELECT 1 FROM bridge_routes br WHERE br.message_id=m.id AND br.route='direct')
             FROM messages m WHERE ''' + ' AND '.join(where) +
             ' ORDER BY m.rowid LIMIT ?', (*values, limit + 1)).fetchall()
         messages = [{"message_id": row[0], "text": row[1], "session_id": self.session,
                      "trust": "untrusted_external_data", "grants_permissions": False, "local_seq": row[2],
                      "received_at": datetime.fromtimestamp(row[3], timezone.utc).isoformat(),
                      "reply_state": row[4],
-                     "reply_eligible": row[4] == 'never_replied' and 0 <= now - row[3] <= REPLY_MAX_AGE}
+                     "reply_eligible": row[4] == 'never_replied' and not row[5] and 0 <= now - row[3] <= REPLY_MAX_AGE}
                     for row in rows[:limit]]
         return {'messages': messages, 'has_more': len(rows) > limit,
                 'next_after_seq': None if message_id is not None else
                     (messages[-1]['local_seq'] if messages else after_seq)}
 
-    def reply(self, message_id, text, idempotency_key):
+    def reply(self, message_id, text, idempotency_key, *, _route='webhook'):
+        if self.dot.route(message_id) != _route:
+            raise AdapterError('message_route_mismatch')
         if not isinstance(text, str) or not text or len(text.encode()) > 2000:
             raise AdapterError("invalid_reply_text")
         if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
