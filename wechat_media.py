@@ -38,6 +38,7 @@ ERROR_CATEGORIES = frozenset({
     'invalid_tts_text', 'tts_library_missing', 'tts_initialization_failed',
     'tts_voice_missing', 'tts_synthesis_failed', 'tts_output_invalid', 'tts_timeout',
     'tts_idempotency_conflict', 'tts_result_unavailable', 'tts_previous_generation_failed',
+    'file_size_mismatch',
 })
 
 

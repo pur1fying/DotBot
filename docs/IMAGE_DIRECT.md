@@ -4,7 +4,7 @@
 
 微信文字、PNG/JPEG/静态 WebP 图片 → broker 原 owner 校验与私有缓存 → 原生房间上传文件并带附件发送 → 同一爱丽丝回复 → 通过原生客户端读取图片附件 → broker 暂存、腾讯 CDN 上传与微信图片消息。
 
-`--images` 仅接受文字与图片，语音和任意文件不进入这条路径。上限沿用媒体校验：每条 8 个附件、单图 4 MiB、2000 万像素，缓存总额 64 MiB、保留 24 小时；微信回复 context 本地限 1 小时。
+`--images` 接受文字、图片消息以及 PNG/JPEG/静态 WebP 图片文件，语音、ZIP 和其他文件不进入这条路径。上限沿用媒体校验：每条 8 个附件、单图 4 MiB、2000 万像素，缓存总额 64 MiB、保留 24 小时；微信回复 context 本地限 1 小时。
 
 ## 恢复与关联
 
@@ -47,9 +47,21 @@
 
 发现并修正一个独立兼容性问题：本地此前仅接受 `encrypt_type=1`，现在支持官方定义的 0/1 两种元数据模式，拒绝未知值和错误类型。该修正已部署，媒体与图片直连相关 44 项检查通过，运行模式仍为 direct。该字段不是图像质量选择器，官方下载器不据此切换高清版本。local_seq=53 在旧校验下已成功接收，说明本次 353 KB 现象并非该拒绝造成。
 
-可验证的备选为文件通道：官方 type=4 的 `file_item.media` 有独立原字节下载分支，可研究将图片按文件或归档传输，再比较原始 bytes。DotBot 当前 `--images` 不接受图片文件/ZIP，此备选尚未接入或完成实测，不能直接承诺保留手机源文件。
+文件通道：官方 type=4 的 `file_item.media` 有独立原字节下载分支。后续已启用 PNG/JPEG/静态 WebP 图片文件入站，见下节；ZIP 和其他文件仍未开启，图片下行的无损文件回传尚未验证。
 
 依据：[官方收件下载](https://github.com/Tencent/openclaw-weixin/blob/main/src/media/media-download.ts)、[CDN URL 构造](https://github.com/Tencent/openclaw-weixin/blob/main/src/cdn/cdn-url.ts)、[解密与 URL 优先级](https://github.com/Tencent/openclaw-weixin/blob/main/src/cdn/pic-decrypt.ts)、[字段定义](https://github.com/Tencent/openclaw-weixin/blob/main/src/api/types.ts)、[issue #28](https://github.com/Tencent/openclaw-weixin/issues/28)、[issue #241](https://github.com/Tencent/openclaw-weixin/issues/241)。
+
+## 图片文件接收（2026-10-10）
+
+用户随后发送约 2 MB 的新 PNG 截图。本地此前的图片模式过滤 type=4，未将这条消息入库。现已支持 `.png/.jpg/.jpeg/.webp` 文件，经 `file_item.media` 下载/解密后使用原生图片直连。保留文件名、声明 MIME 和声明大小作为私有收件元数据；实际 MIME 必须与扩展名一致，若给出 len，解密字节数必须与其一致。单文件仍限制 4 MiB，不接语音、PDF、SVG、ZIP 或任意文件。
+
+通过 owner-only 操作 `dot_recover_image_file`，从之前的收件 checkpoint 读取并恢复了这一条实际文件消息，未让用户重发。操作不回退实时收件游标，只允许在指定已知消息之后、一小时内、原 owner/bot 的最新合格图片文件；先 preview 后 commit，已入库的最新文件不会重复入队或继续向前回放其他历史文件。此操作不开放为 MCP 工具，也不返回 key、URL、context 或 cursor。
+
+实测 local_seq=54：声明与实际下载均为 **2,115,564 字节**，PNG、1206×2622；原生上传成功，爱丽丝的文字描述与本地看到的截图内容一致，两条不同的文字回复均被微信 API 接受。手机源文件哈希未提供，因此不宣称与手机原文件逐字节等价；该样本确认文件入站保留了约 2 MB 的 PNG，未在本地接收时压成几百 KB。这张新图与先前普通图片测试不是同一截图，不能作为同图压缩 A/B 对照。
+
+检查覆盖图片文件直连、实际 bytes、文件长度/扩展名伪造拒绝、语音/其他文件拒绝、恢复 preview/commit/去重与实时游标保留；媒体检查 47 项、文字/查询回归 13 项通过，恢复去重变更另以 11 项图片直连检查复核。
+
+本轮仅实现并验证图片文件**入站**。爱丽丝图片输出仍走微信图片消息，不能据此宣称原文件下行回传无损。私有记录：`image-file-enablement.json`、`latest-image-file-recovery.json`、`wechat-image-file-e2e-test.json`。
 
 本机私有记录位于独立运行目录的 `image-gateway-enablement.json`、`native-image-capability-probe.json`、`native-image-return-probe.json`、`wechat-image-e2e-test.json`，图片、绑定、实际 ID、缓存和数据库不进入 Git。
 

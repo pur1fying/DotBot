@@ -104,7 +104,8 @@ class Broker:
         if method == 'build' and not args:
             return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled,
-                    'images_enabled': self.images_enabled, 'native_voice': False}
+                    'images_enabled': self.images_enabled, 'image_files_enabled': self.images_enabled,
+                    'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
             if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
                 raise AdapterError('invalid_wait_arguments')
@@ -223,6 +224,54 @@ class Broker:
             if set(args) != fields:
                 raise DotError('dot_invalid_arguments')
             return operation(**args)
+        if method == 'dot_recover_image_file' and set(args) == {'checkpoint_cursor', 'after_seq', 'commit'}:
+            if (not self.images_enabled or not isinstance(args['checkpoint_cursor'], str) or
+                    not 0 < len(args['checkpoint_cursor']) <= 65536 or
+                    type(args['after_seq']) is not int or args['after_seq'] < 1 or type(args['commit']) is not bool):
+                raise DotError('dot_invalid_image_recovery')
+            anchor = adapter.db.execute('SELECT received FROM messages WHERE rowid=?', (args['after_seq'],)).fetchone()
+            if not anchor:
+                raise DotError('dot_invalid_image_recovery')
+            # Operator-only replay read. Never rewind or replace the live poll
+            # cursor; only the latest new, owner-bound image file is eligible.
+            response = adapter._request('/ilink/bot/getupdates', {'get_updates_buf': args['checkpoint_cursor']})
+            if any(type(response.get(k, 0)) is not int or response.get(k, 0) != 0 for k in ('ret', 'errcode')):
+                raise DotError('dot_recovery_poll_rejected')
+            msgs = response.get('msgs', [])
+            if not isinstance(msgs, list) or len(msgs) > 1000:
+                raise DotError('dot_recovery_poll_rejected')
+            candidates = []
+            for message in msgs:
+                parsed = adapter._parse_media(message)
+                at = message.get('create_time_ms') if isinstance(message, dict) else None
+                if not parsed or type(at) is not int or not max(anchor[0], self.clock() - 3600) * 1000 <= at <= (self.clock() + 5) * 1000:
+                    continue
+                mid, _, _, refs = parsed
+                if not refs or any(kind != 'image' or ref.get('source_type') != 4 for _, kind, ref in refs):
+                    continue
+                candidates.append((at, mid, message, refs))
+            if not candidates:
+                return {'found': False, 'cursor_changed': False}
+            at, mid, message, refs = max(candidates, key=lambda candidate: candidate[0])
+            known = bool(adapter.db.execute('SELECT 1 FROM messages WHERE id=?', (mid,)).fetchone())
+            result = {'found': True, 'message_id': mid, 'created_at_ms': at,
+                      'files': [{'file_name': ref['file_name'], 'declared_size_bytes': ref['declared_size_bytes']}
+                                for _, _, ref in refs], 'cursor_changed': False, 'recovered': False,
+                      'already_ingested': known}
+            if args['commit'] and not known:
+                ingested = adapter.ingest({'msgs': [message]})
+                result['recovered'] = ingested['accepted'] == 1
+            return result
+        if method == 'dot_image_file_info' and set(args) == {'message_id', 'media_id'}:
+            if not self.images_enabled or not store.job(args['message_id']):
+                raise DotError('dot_image_disabled_or_unknown')
+            row = adapter.db.execute('SELECT reference,metadata FROM media WHERE id=? AND message_id=? AND kind=\'image\'',
+                                     (args['media_id'], args['message_id'])).fetchone()
+            if not row or not row[0]:
+                raise DotError('dot_image_disabled_or_unknown')
+            ref = json.loads(row[0])
+            return {key: ref.get(key) for key in ('source_type', 'file_name', 'declared_mime', 'declared_size_bytes')} | {
+                'downloaded_size_bytes': (json.loads(row[1]) if row[1] else {}).get('size_bytes')}
         if method == 'dot_read_image' and set(args) == {'message_id', 'media_id'}:
             if not self.images_enabled or not store.job(args['message_id']):
                 raise DotError('dot_image_disabled_or_unknown')

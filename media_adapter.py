@@ -16,6 +16,9 @@ from wechat_media import (MediaError, MAX_CACHE, RETENTION, CDN_BASE, reference,
                           crypt, validate_media, decode_base64, cdn_url)
 from urllib.parse import urlencode
 
+IMAGE_FILE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
+
 
 class MediaAdapter(TextAdapter):
     def __init__(self, *args, media_transport=None, silk_decoder=None, tts=None,
@@ -47,7 +50,7 @@ class MediaAdapter(TextAdapter):
                 if not isinstance(item, dict):
                     return None
                 kind = item.get('type')
-                if self.images_only and kind not in (1, 2):
+                if self.images_only and kind not in (1, 2, 4):
                     return None
                 if kind == 1:
                     value = item.get('text_item', {}).get('text')
@@ -72,14 +75,24 @@ class MediaAdapter(TextAdapter):
                                 texts.append('[微信提供的语音转写，未校对] ' + transcript)
                     refs.append((index, media_kind, ref))
                 elif kind == 4:
-                    # Audio attachments are restricted to WAV/SILK; no arbitrary files.
                     field = item.get('file_item')
-                    if not isinstance(field, dict) or not isinstance(field.get('file_name'), str) or not field['file_name'].lower().endswith(('.wav', '.silk')):
+                    name = field.get('file_name') if isinstance(field, dict) else None
+                    if not isinstance(name, str) or not name or len(name.encode()) > 1024 or any(ord(c) < 32 for c in name):
+                        return None
+                    mime = next((mime for suffix, mime in IMAGE_FILE_TYPES.items() if name.lower().endswith(suffix)), None)
+                    if mime is None and (self.images_only or not name.lower().endswith(('.wav', '.silk'))):
                         return None
                     length = field.get('len')
                     if length is not None and (not isinstance(length, str) or not length.isascii() or not length.isdecimal() or not 0 < int(length) <= 4 * 1024 * 1024):
                         return None
-                    refs.append((index, 'audio', reference(field, 'audio')))
+                    media_kind = 'image' if mime else 'audio'
+                    ref = reference(field, media_kind)
+                    if mime:
+                        # Private transport provenance; never choose a local path
+                        # or grant permissions based on an external filename.
+                        ref.update(source_type=4, file_name=name, declared_mime=mime,
+                                   declared_size_bytes=int(length) if length is not None else None)
+                    refs.append((index, media_kind, ref))
                 else:
                     return None
             if len(refs) > 8:
@@ -159,14 +172,16 @@ class MediaAdapter(TextAdapter):
         kind, ref, raw, metadata, state = row
         if state in ('expired', 'forgotten'):
             raise MediaError('media_unavailable')
+        ref = json.loads(ref)
         if raw is None:
             if self.media_transport is None:
                 raise MediaError('media_network_disabled')
-            ref = json.loads(ref)
             raw = self.media_transport.request('GET', ref['url'])
             if ref['key']:
                 raw = crypt(raw, bytes.fromhex(ref['key']))
-        meta = validate_media(raw, kind)
+        meta = validate_media(raw, kind, ref.get('declared_mime'))
+        if ref.get('declared_size_bytes') is not None and len(raw) != ref['declared_size_bytes']:
+            raise MediaError('file_size_mismatch')
         if meta['mime_type'] == 'audio/silk' and self.silk_decoder is not None:
             try:
                 raw = self.silk_decoder(raw)

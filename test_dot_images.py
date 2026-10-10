@@ -8,7 +8,13 @@ from ilink_adapter import Binding
 from ilink_broker import Broker
 from service import PersistentService,OfflineDelivery
 from test_dot_room_gateway import BINDING
-from test_media import FakeCDN,image_item,voice_item,png
+from test_media import FakeCDN,image_item,voice_item,png,KEY
+
+def image_file_item(name='original.png', length=None):
+    field = image_item()['image_item']
+    # Match test_media's fixed key; file keys use base64(hex) on the wire.
+    field['media']['aes_key'] = base64.b64encode(KEY.hex().encode()).decode()
+    return {'type':4,'file_item':{'file_name':name,'len':str(len(png()) if length is None else length),'media':field['media']}}
 
 class ImageGatewayTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -116,5 +122,55 @@ class ImageGatewayTests(unittest.IsolatedAsyncioTestCase):
     async def test_foreign_image_reply_does_not_enter_outbox(self):
         self.admitted();self.assertFalse(self.call('dot_room_message',message=self.reply(senderAeonId='foreign'))['accepted'])
         self.assertIsNone(self.call('dot_output_next'));self.assertEqual(self.sent,[])
+
+    async def test_image_file_bytes_and_receipt_are_preserved(self):
+        self.assertEqual(self.ingest([image_file_item()])['accepted'],1)
+        job=self.call('dot_next');aid=job['images'][0]['media_id']
+        image=self.call('dot_read_image',message_id=job['message_id'],media_id=aid)
+        self.assertEqual(base64.b64decode(image['content'][0]['data']),png())
+        info=self.call('dot_image_file_info',message_id=job['message_id'],media_id=aid)
+        self.assertEqual(info,{'source_type':4,'file_name':'original.png','declared_mime':'image/png',
+            'declared_size_bytes':len(png()),'downloaded_size_bytes':len(png())})
+        self.assertEqual(self.ingest([image_file_item()])['duplicates'],1)
+
+    async def test_image_file_size_and_type_mismatch_are_rejected_before_upload(self):
+        from wechat_media import MediaError
+        for name,size,category in [('original.jpg',len(png()),'mime_content_mismatch'),
+                                   ('original.png',len(png())+1,'file_size_mismatch')]:
+            self.ingest([image_file_item(name,size)],mid=10+size)
+            a=self.b.adapter()
+            try:
+                job=a.dot.job(a.read_page()['messages'][-1]['message_id']);aid=job['images'][0]['media_id']
+                with self.assertRaisesRegex(MediaError,category):a.read_media(job['message_id'],aid)
+                self.assertIsNone(a.db.execute('SELECT blob FROM media WHERE id=?',(aid,)).fetchone()[0])
+            finally:a.close()
+        for name in ['archive.zip','document.pdf','voice.wav','vector.svg']:
+            self.assertEqual(self.ingest([image_file_item(name)],mid=100)['rejected'],1)
+
+    async def test_recovery_only_ingests_latest_owner_file_and_never_rewinds_cursor(self):
+        self.ingest([{'type':1,'text_item':{'text':'anchor'}}]);self.now+=3
+        def message(mid,at,owner='SYNTHETIC-OWNER'):
+            return {'message_id':mid,'from_user_id':owner,'to_user_id':'SYNTHETIC-BOT','message_type':1,
+                'message_state':2,'create_time_ms':at,'context_token':'SYNTHETIC-CONTEXT','item_list':[image_file_item()]}
+        batch=[message(2,1000),message(3,10002000,'other'),message(4,10001000),message(5,10002000)]
+        self.b.exchange=lambda *args:{'ret':0,'msgs':batch,'get_updates_buf':'must-not-replace-live-cursor'}
+        a=self.b.adapter()
+        with a.db:a._set('cursor','live-cursor')
+        a.close()
+        args={'checkpoint_cursor':'old-checkpoint','after_seq':1,'commit':False}
+        preview=self.call('dot_recover_image_file',**args)
+        self.assertTrue(preview['found']);self.assertFalse(preview['recovered'])
+        self.assertEqual(len(self.call('read')['messages']),1)
+        args['commit']=True;recovered=self.call('dot_recover_image_file',**args)
+        self.assertEqual(preview['message_id'],recovered['message_id']);self.assertTrue(recovered['recovered'])
+        self.assertEqual(len(self.call('read')['messages']),2)
+        a=self.b.adapter()
+        try:self.assertEqual(a._get('cursor'),'live-cursor')
+        finally:a.close()
+        again=self.call('dot_recover_image_file',**args)
+        self.assertTrue(again['already_ingested']);self.assertFalse(again['recovered'])
+        self.assertEqual(len(self.call('read')['messages']),2)
+        self.assertEqual(self.call('dot_image_file_info',message_id=recovered['message_id'],
+            media_id=self.call('dot_reconcile_jobs')['jobs'][-1]['images'][0]['media_id'])['source_type'],4)
 
 if __name__=='__main__':unittest.main()
