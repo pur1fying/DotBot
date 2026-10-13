@@ -121,3 +121,20 @@ test('image download verifies the dot author and opaque attachment; no signed UR
     'dot_image_message_unavailable');
   assert.equal(f.downloads.length, 1); bridge.dispose();
 });
+test('reusing an uploaded image checks the native file in the pinned room without exporting bytes', async () => {
+  const f = fixture(); const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
+  const result = await bridge.invoke('check_image_file', {file_id: 'CalpicoFile_original'});
+  assert.equal(result.value.available, true); assert.equal(result.value.size_bytes, 8);
+  assert.equal(result.value.mime_type, 'image/png');
+  assert.equal(f.downloads[0][0], 'room');
+  assert.equal(f.downloads[0][2].fileId, 'CalpicoFile_original');
+  assert.equal('data_base64' in result.value, false);
+  assert.equal(JSON.stringify(result).includes('private-signed-media'), false);
+  assert.equal((await bridge.invoke('check_image_file', {file_id: 'https://foreign/file'})).error,
+    'dot_invalid_image_query');
+  assert.equal((await bridge.invoke('check_image_file', {file_id: 'CalpicoFile_original', roomId: 'other'})).error,
+    'dot_invalid_image_query');
+  f.changeAccount();
+  assert.equal((await bridge.invoke('check_image_file', {file_id: 'CalpicoFile_original'})).error, 'auth_account_changed');
+  assert.equal(f.downloads.length, 1); bridge.dispose();
+});

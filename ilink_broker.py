@@ -105,7 +105,8 @@ class Broker:
             return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled,
                     'images_enabled': self.images_enabled, 'image_files_enabled': self.images_enabled,
-                    'quote_metadata_enabled': True, 'native_voice': False}
+                    'quote_metadata_enabled': True, 'quote_images_enabled': self.images_enabled,
+                    'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
             if type(args['after_seq']) is not int or args['after_seq'] < 0 or type(args['timeout_ms']) is not int or not 0 <= args['timeout_ms'] <= 25000:
                 raise AdapterError('invalid_wait_arguments')

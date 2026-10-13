@@ -187,6 +187,24 @@ export async function createDesktopRoomBridge(shared, native, binding) {
         return {ok: true, value: {file_id: uploaded.fileId, mime_type: uploaded.mime,
           status: uploaded.status, size_bytes: binary.length}};
       }
+      if (operation === 'check_image_file') {
+        if (Object.keys(args).some(key => key !== 'file_id') ||
+            !/^CalpicoFile_[A-Za-z0-9_-]{1,200}$/.test(args.file_id ?? ''))
+          throw new Error('dot_invalid_image_query');
+        // Use the native file reader in the pinned room. The gateway only
+        // supplies IDs already recorded for this bound owner's images.
+        const result = await room.media.image(roomId, '', {
+          type: 'file', attachmentId: args.file_id, fileId: args.file_id, mime: ''
+        }, controller.signal);
+        assertCurrent();
+        const mime = result.attachment?.mime || result.image?.type;
+        const available = result.image instanceof Blob && result.image.size > 0 &&
+          result.image.size <= 4 * 1024 * 1024 &&
+          ['image/png', 'image/jpeg', 'image/webp'].includes(mime);
+        return {ok: true, value: {available, file_id: args.file_id,
+          mime_type: available ? mime : null,
+          size_bytes: available ? result.image.size : null}};
+      }
       if (operation === 'download_image') {
         if (Object.keys(args).some(key => !['message_id', 'attachment_id', 'parent_id'].includes(key)) ||
             ['message_id', 'attachment_id', 'parent_id'].some(key => typeof args[key] !== 'string' ||
@@ -197,7 +215,7 @@ export async function createDesktopRoomBridge(shared, native, binding) {
           const page = await room.client.messages(roomId, {
             replyRootMessageId: binding.reply_anchor_message_id, after: cursor, limit: 20});
           message = page.messages.find(value => value.id === args.message_id);
-          if (message || !page.messages.length || !page.after) break;
+          if (message || !page.messages.length || (!page.after && page.messages.length < 20)) break;
           cursor = page.messages.at(-1).id;
         }
         assertCurrent();

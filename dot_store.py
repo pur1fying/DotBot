@@ -110,6 +110,7 @@ def visible_text(item):
 class DotStore:
     def __init__(self, db, now=time.time):
         self.db, self.now = db, now
+        self.quote_images_enabled = False
 
     def _get(self, key, default=None):
         row = self.db.execute('SELECT v FROM meta WHERE k=?', ('dot.' + key,)).fetchone()
@@ -213,8 +214,9 @@ class DotStore:
         if not row:
             return None
         job = dict(zip([column[0] for column in cursor.description], row))
-        from wechat_quotes import read
+        from wechat_quotes import read, image_sources
         job['quotes'] = read(self.db, message_id)
+        job['quoted_images'] = image_sources(self.db, job['quotes'], self.now()) if self.quote_images_enabled else []
         job['images'] = []
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media'").fetchone():
             job['images'] = [dict(zip(('media_id', 'state', 'file_id'), values)) for values in

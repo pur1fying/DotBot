@@ -173,4 +173,119 @@ class ImageGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.call('dot_image_file_info',message_id=recovered['message_id'],
             media_id=self.call('dot_reconcile_jobs')['jobs'][-1]['images'][0]['media_id'])['source_type'],4)
 
+
+    def saved_image_source(self):
+        self.ingest();job=self.call('dot_next');aid=job['images'][0]['media_id']
+        self.call('dot_input_image_begin',message_id=job['message_id'],media_id=aid)
+        self.call('dot_input_image_done',message_id=job['message_id'],media_id=aid,file_id='CalpicoFile_original')
+        self.call('dot_submitting',message_id=job['message_id'])
+        self.call('dot_room_message',message=self.own(job))
+        self.call('dot_room_message',message=self.reply(images=[],text='收到图片'))
+        self.call('dot_drain_one')
+        return job['message_id']
+
+    def add_image_quote(self,reference='1',with_image=False,repeat=False):
+        item={'type':1,'text_item':{'text':'引用的图片是什么'},'ref_msg':{'message_item':{'msg_id':reference}}}
+        items=([image_item()] if with_image else [])+[item]
+        if repeat:items.append(item)
+        self.ingest(items,mid=2)
+
+    async def test_expired_inbound_image_reuses_native_file_without_uploading_again(self):
+        self.saved_image_source();self.now+=86401
+        a=self.b.adapter();a.prune();a.close()
+        self.add_image_quote(repeat=True);calls=[];fixture=self
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='check_image_file':return {'available':True,'file_id':args['file_id']}
+                if op=='send':return dict(fixture.own(fixture.call('dot_next')),id='quoted-input',attachmentCount=1)
+                raise AssertionError(op)
+        await Gateway(self.rpc,Room(),BINDING).submit()
+        sent=next(args for op,args in calls if op=='send')
+        self.assertEqual(sent['attachmentIds'],['CalpicoFile_original'])
+        self.assertEqual([op for op,_ in calls].count('check_image_file'),1)
+        self.assertIn('"status": "attached"',sent['text']);self.assertIn('"attachment_number": 1',sent['text'])
+        self.assertNotIn('[媒体消息，请读取附件]',sent['text'])
+        self.assertNotIn('CalpicoFile_original',sent['text'])
+        self.assertNotIn('upload_image',[op for op,_ in calls])
+
+    async def test_current_image_and_quoted_image_have_distinct_attachment_numbers(self):
+        self.saved_image_source();self.add_image_quote(with_image=True);calls=[];fixture=self
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='upload_image':return {'file_id':'CalpicoFile_current'}
+                if op=='check_image_file':return {'available':True}
+                if op=='send':return dict(fixture.own(fixture.call('dot_next')),id='quoted-input',attachmentCount=2)
+        await Gateway(self.rpc,Room(),BINDING).submit()
+        sent=next(args for op,args in calls if op=='send')
+        self.assertEqual(sent['attachmentIds'],['CalpicoFile_current','CalpicoFile_original'])
+        self.assertIn('"attachment_number": 2',sent['text'])
+
+    async def test_forgotten_quote_image_is_not_read_or_reattached(self):
+        original=self.saved_image_source();a=self.b.adapter();a.forget_media(original);a.close()
+        self.add_image_quote();calls=[];fixture=self
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='send':return dict(fixture.own(fixture.call('dot_next')),id='quoted-input',attachmentCount=0)
+                raise AssertionError(op)
+        await Gateway(self.rpc,Room(),BINDING).submit()
+        sent=next(args for op,args in calls if op=='send')
+        self.assertNotIn('attachmentIds',sent);self.assertIn('"reason": "forgotten"',sent['text'])
+
+    async def test_disabling_images_disables_quote_attachment_reuse(self):
+        self.saved_image_source();self.b.images_enabled=False;self.add_image_quote()
+        self.assertEqual(self.call('dot_next')['quoted_images'],[])
+
+    async def test_missing_native_quote_file_is_reported_without_blocking_current_text(self):
+        self.saved_image_source();self.add_image_quote();calls=[];fixture=self
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='check_image_file':raise DotError('desktop_room_request_failed',status=404)
+                if op=='send':return dict(fixture.own(fixture.call('dot_next')),id='quoted-input',attachmentCount=0)
+        await Gateway(self.rpc,Room(),BINDING).submit()
+        sent=next(args for op,args in calls if op=='send')
+        self.assertNotIn('attachmentIds',sent);self.assertIn('native_image_unavailable',sent['text'])
+        self.assertNotIn('"status": "attached"',sent['text'])
+
+    async def test_forget_during_quote_check_invalidates_the_prepared_send(self):
+        original=self.saved_image_source();self.add_image_quote();calls=[];fixture=self
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='check_image_file':
+                    a=fixture.b.adapter();a.forget_media(original);a.close()
+                    return {'available':True}
+                raise AssertionError('send must not occur after forget')
+        await Gateway(self.rpc,Room(),BINDING).submit()
+        self.assertEqual(self.call('dot_next')['state'],'queued')
+        self.assertNotIn('send',[op for op,_ in calls])
+
+    async def test_quote_of_sent_image_reuses_its_bound_native_attachment(self):
+        exchange=self.b.exchange
+        self.b.exchange=lambda *args:{**exchange(*args),'message_id':'900'}
+        self.admitted();self.call('dot_room_message',message=self.reply());fixture=self;calls=[]
+        class Room:
+            async def invoke(self,op,args=None):
+                calls.append((op,args))
+                if op=='status':return {'subscribed':True}
+                if op=='download_image':return {'data_base64':base64.b64encode(png()).decode(),
+                    'source_type':'file','source_file_id':'CalpicoFile_reply'}
+                if op=='send':return dict(fixture.own(fixture.call('dot_next')),id='quoted-input',attachmentCount=1)
+                raise AssertionError(op)
+        gateway=Gateway(self.rpc,Room(),BINDING);await gateway.drain()
+        self.add_image_quote(reference='900');await gateway.submit()
+        sent=next(args for op,args in calls if op=='send')
+        self.assertEqual(sent['attachmentIds'],['CalpicoFile_reply'])
+        self.assertIn('"direction": "outbound"',sent['text'])
+        self.assertEqual([args for op,args in calls if op=='download_image'][-1],
+                         {'message_id':'output','parent_id':'input','attachment_id':'image1'})
+
 if __name__=='__main__':unittest.main()

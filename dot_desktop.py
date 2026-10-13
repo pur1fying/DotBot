@@ -136,7 +136,7 @@ class DesktopRoomClient:
             self.pending.pop(request_id, None)
 
     async def invoke(self, operation, arguments=None):
-        if operation not in ('status', 'messages', 'send', 'wait', 'upload_image', 'download_image'):
+        if operation not in ('status', 'messages', 'send', 'wait', 'upload_image', 'download_image', 'check_image_file'):
             raise DotError('desktop_operation_not_allowed')
         if self.object_id is None:
             raise DotError('desktop_bridge_closed')
@@ -145,7 +145,7 @@ class DesktopRoomClient:
                 'objectId': self.object_id,
                 'functionDeclaration': 'function(op, args) { return this.invoke(op, args); }',
                 'arguments': [{'value': operation}, {'value': arguments or {}}],
-                'awaitPromise': True, 'returnByValue': True}, timeout=60 if operation in ('send', 'upload_image', 'download_image') else 35)
+                'awaitPromise': True, 'returnByValue': True}, timeout=60 if operation in ('send', 'upload_image', 'download_image', 'check_image_file') else 35)
             if result.get('exceptionDetails'):
                 raise DotError('desktop_room_request_failed')
             response = result.get('result', {}).get('value', {})

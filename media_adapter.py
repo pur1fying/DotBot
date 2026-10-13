@@ -25,6 +25,7 @@ class MediaAdapter(TextAdapter):
                  images_only=False, direct_images=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.images_only, self.direct_images = images_only, direct_images
+        self.dot.quote_images_enabled = direct_images
         self.media_transport, self.silk_decoder = media_transport, silk_decoder
         self.tts = tts
         self.db.executescript('''

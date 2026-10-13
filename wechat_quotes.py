@@ -108,6 +108,39 @@ def read(db, message_id):
     return quotes
 
 
+def image_sources(db, quotes, now):
+    """Private attachment plan; never copy CDN references into model context."""
+    if not quotes or not db.execute("SELECT 1 FROM sqlite_master WHERE name='media'").fetchone():
+        return []
+    sources = []
+    for index, quote in enumerate(quotes):
+        local_id = quote.get('referenced_local_id')
+        if not local_id:
+            continue
+        if quote.get('direction') == 'inbound':
+            rows = db.execute('''SELECT m.id,m.state,i.state,i.file_id FROM media m
+                LEFT JOIN dot_input_images i ON i.message_id=m.message_id AND i.media_id=m.id
+                WHERE m.message_id=? AND m.kind='image' ORDER BY m.rowid LIMIT 8''', (local_id,))
+            for media_id, cache_state, upload_state, file_id in rows:
+                reusable = cache_state != 'forgotten' and upload_state == 'ready' and bool(file_id)
+                sources.append({'quote_index': index, 'source': 'inbound', 'media_id': media_id,
+                    'file_id': file_id if reusable else None,
+                    'unavailable_reason': None if reusable else ('forgotten' if cache_state == 'forgotten' else 'not_uploaded')})
+        elif quote.get('direction') == 'outbound':
+            row = db.execute('''SELECT o.attachment_id,o.parent_id,s.expires FROM dot_outbox o
+                LEFT JOIN staged_media s ON s.id=o.media_id
+                WHERE o.idempotency_key=? AND o.kind='image' AND o.state='api_accepted' ''', (local_id,)).fetchone()
+            if row:
+                aid, parent, expires = row
+                # An expired/deleted outgoing cache cannot distinguish an old
+                # expiry from a deliberate forget. Do not resurrect it.
+                usable = expires is not None and expires > now
+                sources.append({'quote_index': index, 'source': 'outbound',
+                    'attachment_id': aid, 'native_source': json.loads(parent) if usable else None,
+                    'unavailable_reason': None if usable else 'expired_or_forgotten'})
+    return sources
+
+
 def prompt(text, quotes):
     if not quotes:
         return text
