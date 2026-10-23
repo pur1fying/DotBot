@@ -13,7 +13,7 @@ import wave
 
 from ilink_adapter import TextAdapter, AdapterError, acknowledgement
 from wechat_media import (MediaError, MAX_CACHE, RETENTION, CDN_BASE, reference,
-                          crypt, validate_media, decode_base64, cdn_url)
+                          crypt, validate_media, validate_file, decode_base64, cdn_url)
 from urllib.parse import urlencode
 
 IMAGE_FILE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg',
@@ -215,15 +215,20 @@ class MediaAdapter(TextAdapter):
             self.db.execute("UPDATE tts_generations SET state='forgotten',media_id=NULL WHERE message_id=?", (message_id,))
         return {'message_id': message_id, 'forgotten': changed}
 
-    def stage_media(self, message_id, data_base64, mime_type):
+    def stage_media(self, message_id, data_base64, mime_type, *, file_name=None):
         """Local operator IPC only: place explicitly selected output bytes, no send."""
         self.prune()
         if not self.db.execute('SELECT 1 FROM messages WHERE id=?', (message_id,)).fetchone():
             raise MediaError('unknown_message')
         kind = 'image' if mime_type.startswith('image/') else 'audio'
         raw = decode_base64(data_base64)
-        validate_media(raw, kind, mime_type)
-        if mime_type not in ('image/png', 'image/jpeg', 'image/webp', 'audio/wav'):
+        if file_name is not None:
+            validate_file(raw, file_name)
+            if mime_type != 'application/octet-stream':
+                raise MediaError('unsupported_media_kind')
+        else:
+            validate_media(raw, kind, mime_type)
+        if file_name is None and mime_type not in ('image/png', 'image/jpeg', 'image/webp', 'audio/wav'):
             raise MediaError('unsupported_media_kind')
         aid = 'out_' + secrets.token_hex(16)
         with self.db:
@@ -294,12 +299,12 @@ class MediaAdapter(TextAdapter):
                 'duration_ms': meta['duration_ms'], 'sample_rate_hz': rate,
                 'size_bytes': len(raw), 'sha256': meta['sha256']}
 
-    def reply_media(self, message_id, mime_type, idempotency_key, delivery_mode, data_base64=None, media_id=None, *, _route='webhook'):
+    def reply_media(self, message_id, mime_type, idempotency_key, delivery_mode, data_base64=None, media_id=None, *, _route='webhook', file_name=None):
         if self.dot.route(message_id) != _route:
             raise AdapterError('message_route_mismatch')
-        if delivery_mode not in ('image', 'audio_attachment'):
+        if delivery_mode not in ('image', 'audio_attachment', 'file_attachment'):
             raise MediaError('native_voice_not_verified')
-        kind = 'image' if delivery_mode == 'image' else 'audio'
+        kind = 'image' if delivery_mode == 'image' else 'file' if delivery_mode == 'file_attachment' else 'audio'
         if (data_base64 is None) == (media_id is None):
             raise MediaError('media_source_required')
         if media_id is not None:
@@ -312,12 +317,12 @@ class MediaAdapter(TextAdapter):
             raw = cached[0]
         else:
             raw = decode_base64(data_base64)
-        meta = validate_media(raw, kind, mime_type)
+        meta = validate_file(raw, file_name) if kind == 'file' else validate_media(raw, kind, mime_type)
         if kind == 'audio' and mime_type != 'audio/wav':
             raise MediaError('outgoing_audio_requires_wav')
         if not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128:
             raise MediaError('invalid_idempotency_key')
-        fingerprint = 'media:' + json.dumps([delivery_mode, mime_type, meta['sha256']], separators=(',', ':'))
+        fingerprint = 'media:' + json.dumps([delivery_mode, mime_type, meta['sha256']] + ([file_name] if kind == 'file' else []), separators=(',', ':'))
         old = self.db.execute('SELECT message_id,text,state FROM replies WHERE k=?', (idempotency_key,)).fetchone()
         if old:
             if old[:2] != (message_id, fingerprint):
@@ -358,7 +363,7 @@ class MediaAdapter(TextAdapter):
                 raise MediaError('cdn_upload_ack_missing')
             media = {'encrypt_query_param': download_param, 'aes_key': base64.b64encode(key.hex().encode()).decode(), 'encrypt_type': 1}
             item = {'type': 2, 'image_item': {'media': media, 'mid_size': len(ciphertext)}} if kind == 'image' else {
-                'type': 4, 'file_item': {'media': media, 'file_name': 'alice-audio.wav', 'len': str(len(raw))}}
+                'type': 4, 'file_item': {'media': media, 'file_name': file_name if kind == 'file' else 'alice-audio.wav', 'len': str(len(raw))}}
             ack = self._request('/ilink/bot/sendmessage', {'msg': {
                 'from_user_id': '', 'to_user_id': self.binding.user_id, 'client_id': client_id,
                 'message_type': 2, 'message_state': 2, 'context_token': row[0], 'item_list': [item]}})
@@ -366,7 +371,7 @@ class MediaAdapter(TextAdapter):
             if state == 'api_accepted':
                 from wechat_quotes import record_sent
                 with self.db:
-                    record_sent(self.db, ack, idempotency_key, '[图片]' if kind == 'image' else '[音频文件]')
+                    record_sent(self.db, ack, idempotency_key, '[图片]' if kind == 'image' else f'[文件：{file_name}]' if kind == 'file' else '[音频文件]')
             http_status = 200
         except AdapterError as e:
             category, http_status = getattr(e, 'category', 'media_exchange_failed'), getattr(e, 'http_status', None)

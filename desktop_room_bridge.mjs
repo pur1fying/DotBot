@@ -119,6 +119,8 @@ export async function createDesktopRoomBridge(shared, native, binding) {
       images: (message.attachments ?? []).filter(isImage).slice(0, 8).map(attachment => ({
         attachment_id: attachment.attachmentId, file_id: attachment.fileId || null,
         mime_type: attachment.mime || null, loading: Boolean(attachment.isLoading)})),
+      files: (message.attachments ?? []).filter(a => a.type === 'file' && !isImage(a)).slice(0, 8)
+        .map(a => ({attachment_id: a.attachmentId, loading: Boolean(a.isLoading)})),
       questions, requiresUserAction: Boolean(elicitation),
       metadataKeys: Object.keys(message.messageMetadata ?? {}), aeonMetadata,
       turnTrigger: /^[a-z_]{1,80}$/.test(message.messageMetadata?.turn_trigger ?? '')
@@ -205,7 +207,8 @@ export async function createDesktopRoomBridge(shared, native, binding) {
           mime_type: available ? mime : null,
           size_bytes: available ? result.image.size : null}};
       }
-      if (operation === 'download_image') {
+      if (operation === 'download_image' || operation === 'download_file') {
+        const kind = operation === 'download_file' ? 'file' : 'image';
         if (Object.keys(args).some(key => !['message_id', 'attachment_id', 'parent_id'].includes(key)) ||
             ['message_id', 'attachment_id', 'parent_id'].some(key => typeof args[key] !== 'string' ||
               !args[key] || args[key].length > 256))
@@ -222,8 +225,28 @@ export async function createDesktopRoomBridge(shared, native, binding) {
         if (!message || message.self !== false || message.role !== 'user' ||
             message.senderAeonId !== binding.dot_id ||
             message.replyRootMessageId !== binding.reply_anchor_message_id)
-          throw new Error('dot_image_message_unavailable');
+          throw new Error(`dot_${kind}_message_unavailable`);
         const attachment = message.attachments?.find(value => value.attachmentId === args.attachment_id);
+        if (kind === 'file') {
+          if (!attachment || attachment.type !== 'file' || isImage(attachment))
+            throw new Error('dot_file_attachment_unavailable');
+          if (attachment.isLoading) throw new Error('dot_file_not_ready');
+          if (attachment.sizeBytes > 4 * 1024 * 1024) throw new Error('dot_file_too_large');
+          let result;
+          try { result = await room.media.content(roomId, message.id, attachment.attachmentId, 'document', controller.signal); }
+          catch (error) {
+            if ([404, 410].includes(error?.status)) throw new Error('dot_file_attachment_unavailable');
+            throw error;
+          }
+          assertCurrent();
+          if (!(result.blob instanceof Blob) || !result.blob.size) throw new Error('dot_file_attachment_unavailable');
+          if (result.blob.size > 4 * 1024 * 1024) throw new Error('dot_file_too_large');
+          const bytes = new Uint8Array(await result.blob.arrayBuffer());
+          let binary = '';
+          for (let offset = 0; offset < bytes.length; offset += 32768)
+            binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+          return {ok: true, value: {data_base64: btoa(binary), file_name: result.name ?? attachment.name ?? 'attachment'}};
+        }
         if (!isImage(attachment)) throw new Error('dot_image_attachment_unavailable');
         if (attachment.isLoading) throw new Error('dot_image_not_ready');
         const result = await room.media.image(roomId, message.id, attachment, controller.signal);

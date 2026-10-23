@@ -15,7 +15,7 @@ CANARY_PREFIX = '【DotBot直连测试】'
 
 
 def initialize(db):
-    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('3',):
+    if db.execute("SELECT v FROM meta WHERE k='dot.schema_version'").fetchone() == ('4',):
         return
     db.executescript('''
       CREATE TABLE IF NOT EXISTS bridge_routes (
@@ -54,13 +54,13 @@ def initialize(db):
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS dot_jobs_room_message ON dot_jobs(room_message_id)')
     columns = {row[1] for row in db.execute('PRAGMA table_info(dot_outbox)')}
     for name, sql_type in (('kind', "TEXT NOT NULL DEFAULT 'text'"), ('media_id', 'TEXT'),
-                           ('mime_type', 'TEXT'), ('attachment_id', 'TEXT'), ('parent_id', 'TEXT')):
+                           ('mime_type', 'TEXT'), ('attachment_id', 'TEXT'), ('parent_id', 'TEXT'), ('file_name', 'TEXT')):
         if name not in columns:
             db.execute(f'ALTER TABLE dot_outbox ADD COLUMN {name} {sql_type}')
     # Existing messages stay on their original route; activating never replays history.
     with db:
         db.execute("INSERT OR IGNORE INTO bridge_routes SELECT id,'webhook',received FROM messages")
-        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','3')")
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('dot.schema_version','4')")
 
 
 def split_text(text, limit=2000):
@@ -111,6 +111,7 @@ class DotStore:
     def __init__(self, db, now=time.time):
         self.db, self.now = db, now
         self.quote_images_enabled = False
+        self.file_outputs_enabled = False
 
     def _get(self, key, default=None):
         row = self.db.execute('SELECT v FROM meta WHERE k=?', ('dot.' + key,)).fetchone()
@@ -356,25 +357,25 @@ class DotStore:
             if result.rowcount != 1:
                 raise DotError('dot_submission_not_proven_unsent')
 
-    def _enqueue_images(self, message_id, message):
-        images = message.get('images') or []
-        if not isinstance(images, list) or len(images) > 8:
-            raise DotError('dot_invalid_image_output')
+    def _enqueue_attachments(self, message_id, message, kind):
+        attachments = message.get('images' if kind == 'image' else 'files') or []
+        if not isinstance(attachments, list) or len(attachments) > 8:
+            raise DotError('dot_invalid_' + kind + '_output')
         added = 0
         with self.db:
-            for image in images:
-                aid = image.get('attachment_id') if isinstance(image, dict) else None
+            for attachment in attachments:
+                aid = attachment.get('attachment_id') if isinstance(attachment, dict) else None
                 if not isinstance(aid, str) or not aid or len(aid) > 256:
-                    raise DotError('dot_invalid_image_output')
+                    raise DotError('dot_invalid_' + kind + '_output')
                 suffix = hashlib.sha256((message['id'] + '\0' + aid).encode()).hexdigest()
-                iid = 'image_' + suffix
+                iid = kind + '_' + suffix
                 if self.db.execute('SELECT 1 FROM dot_items WHERE item_id=?', (iid,)).fetchone():
                     continue
                 self.db.execute('INSERT INTO dot_items VALUES (?,?,?,?)', (iid, message_id, suffix, self.now()))
                 self.db.execute('''INSERT INTO dot_outbox
                   (item_id,message_id,part,text,idempotency_key,state,kind,attachment_id,parent_id)
-                  VALUES (?,?,0,'',?,'awaiting_media','image',?,?)''',
-                  (iid, message_id, message_id + '-dot-image-' + suffix[:24], aid,
+                  VALUES (?,?,0,'',?,'awaiting_media',?,?,?)''',
+                  (iid, message_id, message_id + '-dot-' + kind + '-' + suffix[:24], kind, aid,
                    json.dumps({'message_id': message['id'], 'parent_id': message.get('replyToMessageId')})))
                 added += 1
             if added:
@@ -388,6 +389,20 @@ class DotStore:
                                      (media_id, mime_type, item_id))
             if changed.rowcount != 1:
                 raise DotError('dot_image_output_not_pending')
+        return {'ready': True}
+
+    def output_file_ready(self, item_id, media_id, file_name):
+        with self.db:
+            changed = self.db.execute("UPDATE dot_outbox SET media_id=?,mime_type='application/octet-stream',file_name=?,state='ready' WHERE item_id=? AND kind='file' AND state='awaiting_media'", (media_id, file_name, item_id))
+            if changed.rowcount != 1:
+                raise DotError('dot_file_output_not_pending')
+        return {'ready': True}
+
+    def output_file_unavailable(self, item_id):
+        with self.db:
+            changed = self.db.execute("UPDATE dot_outbox SET kind='text',text=?,state='ready' WHERE item_id=? AND kind='file' AND state='awaiting_media'", ('文件未能回传：附件可能超过 4 MiB、已失效、文件名无效或缓存空间不足，请在 Codex 中查看原附件。', item_id))
+            if changed.rowcount != 1:
+                raise DotError('dot_file_output_not_pending')
         return {'ready': True}
 
     def room_message(self, message):
@@ -428,10 +443,13 @@ class DotStore:
         if not job or job['state'] in ('queued', 'expired', 'rolled_back') or self.now() - job['received_at'] > REPLY_WINDOW:
             return {'accepted': False, 'category': 'reply_window_expired'}
         text = visible_text(message)
-        if not text.strip() and not message.get('images'):
+        if not text.strip() and not message.get('images') and not (self.file_outputs_enabled and message.get('files')):
             text = '爱丽丝发来需要确认的请求，请打开 Codex 查看并处理。'
         result = self._enqueue(row[0], iid, text)
-        images_added = self._enqueue_images(row[0], message)
+        images_added = self._enqueue_attachments(row[0], message, 'image')
+        files_added = self._enqueue_attachments(row[0], message, 'file') if self.file_outputs_enabled else 0
+        if files_added:
+            result = {'accepted': True, 'message_id': row[0], 'files': files_added}
         if images_added:
             result = {'accepted': True, 'message_id': row[0], 'images': images_added}
         with self.db:

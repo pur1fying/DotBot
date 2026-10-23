@@ -52,13 +52,14 @@ def load_binding(directory):
 
 class Broker:
     def __init__(self, directory, binding, exchange, clock=time.time, *, media_enabled=False,
-                 images_enabled=False, media_transport=None, silk_decoder=None, tts=None):
+                 images_enabled=False, files_enabled=False, media_transport=None, silk_decoder=None, tts=None):
         self.directory, self.binding, self.clock = directory, binding, clock
         self.lock = threading.Lock()
         self.changed = threading.Condition()
         self.status = {'bound': True, 'owner_bound': True, 'poll_state': 'starting'}
         self.media_enabled, self.media_transport, self.silk_decoder = media_enabled, media_transport, silk_decoder
         self.images_enabled = images_enabled
+        self.files_enabled = files_enabled
         self.tts = tts
         if media_enabled:
             from local_tts import LocalTTS
@@ -88,12 +89,14 @@ class Broker:
 
     def adapter(self, recover=False):
         klass, options = TextAdapter, {}
-        if self.media_enabled or self.images_enabled:
+        if self.media_enabled or self.images_enabled or self.files_enabled:
             from media_adapter import MediaAdapter
             klass, options = MediaAdapter, {'media_transport': self.media_transport, 'silk_decoder': self.silk_decoder,
                 'tts': self.tts, 'images_only': not self.media_enabled, 'direct_images': self.images_enabled}
-        return klass(self.directory / 'messages.sqlite', self.binding,
+        adapter = klass(self.directory / 'messages.sqlite', self.binding,
                      test_exchange=self.exchange, clock=self.clock, recover_sending=recover, **options)
+        adapter.dot.file_outputs_enabled = self.files_enabled
+        return adapter
 
     def call(self, request):
         if not isinstance(request, dict) or set(request) != {'method', 'arguments'} or not isinstance(request['arguments'], dict):
@@ -105,6 +108,7 @@ class Broker:
             return {'broker_build': 'dot-desktop-room-20261010', 'optional_ret_with_valid_id': True,
                     'per_reply_diagnostics': True, 'media_enabled': self.media_enabled,
                     'images_enabled': self.images_enabled, 'image_files_enabled': self.images_enabled,
+                    'output_files_enabled': self.files_enabled, 'output_file_max_bytes': 4 * 1024 * 1024,
                     'quote_metadata_enabled': True, 'quote_images_enabled': self.images_enabled,
                     'native_voice': False}
         if method == 'wait_inbox' and set(args) == {'after_seq', 'timeout_ms'}:
@@ -291,6 +295,21 @@ class Broker:
             meta = validate_media(decode_base64(args['data_base64']), 'image')
             staged = adapter.stage_media(part['message_id'], args['data_base64'], meta['mime_type'])
             return store.output_image_ready(part['item_id'], staged['media_id'], meta['mime_type'])
+        if method in ('dot_stage_output_file', 'dot_output_file_unavailable'):
+            expected = {'item_id', 'data_base64', 'file_name'} if method == 'dot_stage_output_file' else {'item_id'}
+            part = store.next_part()
+            if (set(args) != expected or not self.files_enabled or not part or
+                    part['kind'] != 'file' or part['state'] != 'awaiting_media' or part['item_id'] != args['item_id']):
+                raise DotError('dot_invalid_file_output')
+            if method == 'dot_output_file_unavailable':
+                return store.output_file_unavailable(part['item_id'])
+            from wechat_media import MediaError
+            try:
+                staged = adapter.stage_media(part['message_id'], args['data_base64'],
+                    'application/octet-stream', file_name=args['file_name'])
+            except MediaError:
+                return store.output_file_unavailable(part['item_id'])
+            return store.output_file_ready(part['item_id'], staged['media_id'], args['file_name'])
         if method == 'dot_drain_one' and not args:
             if self.status['poll_state'] == 'session_paused':
                 raise DotError('wechat_session_paused')
@@ -299,7 +318,10 @@ class Broker:
                 return None
             store.begin_part(part['item_id'], part['part'])
             try:
-                if part['kind'] == 'image':
+                if part['kind'] == 'file':
+                    result = adapter.reply_media(part['message_id'], part['mime_type'], part['idempotency_key'],
+                        'file_attachment', media_id=part['media_id'], file_name=part['file_name'], _route='direct')
+                elif part['kind'] == 'image':
                     result = adapter.reply_media(part['message_id'], part['mime_type'], part['idempotency_key'],
                         'image', media_id=part['media_id'], _route='direct')
                 else:
@@ -366,6 +388,7 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--files', action='store_true', help='Enable native output file attachments (4 MiB)')
     parser.add_argument('--media', action='store_true', help='Enable the full media tools and Tencent CDN I/O')
     parser.add_argument('--images', action='store_true', help='Enable image-only native direct routing and Tencent CDN I/O')
     parser.add_argument('--silk-node', help='Absolute Node executable for optional local silk-wasm decoder; no STT/TTS')
@@ -384,8 +407,8 @@ def main():
         from silk_decoder import SilkDecoder
         decoder = SilkDecoder(args.silk_node)
     broker = Broker(PRIVATE, binding, ILinkHTTPS().exchange,
-                    media_enabled=args.media, images_enabled=args.images,
-                    media_transport=CDNHTTPS(enabled=True) if args.media or args.images else None, silk_decoder=decoder)
+                    media_enabled=args.media, images_enabled=args.images, files_enabled=args.files,
+                    media_transport=CDNHTTPS(enabled=True) if args.media or args.images or args.files else None, silk_decoder=decoder)
     SOCKET.unlink(missing_ok=True)
     server = Server(str(SOCKET), Handler)
     os.chmod(SOCKET, 0o600)

@@ -1,4 +1,6 @@
 import test from 'node:test';
+import {File} from 'node:buffer';
+globalThis.File ??= File;
 import assert from 'node:assert/strict';
 import {createDesktopRoomBridge} from './desktop_room_bridge.mjs';
 
@@ -16,6 +18,9 @@ function fixture(options = {}) {
   if (options.imageReply) Object.assign(msg, {self: false, senderAeonId: 'dot',
     replyRootMessageId: 'anchor', attachments: [{type: 'file', attachmentId: 'image',
       fileId: 'file', mime: 'image/png', url: 'private-signed-media'}]});
+  if (options.fileReply) Object.assign(msg, {self: false, senderAeonId: 'dot',
+    replyRootMessageId: 'anchor', attachments: [{type: 'file', attachmentId: 'document',
+      name: '报告.txt', mime: 'text/plain', sizeBytes: options.large ? 5000000 : 3, url: 'private-signed-media'}]});
   const scope = {get: key => state[key], watch: fn => { watch = fn; return () => { stopped++; }; }};
   const shared = {Agt() {}, NOt: 'ready', AOt: 'account', FOt: 'user', kOt: 'structure', MOt: 'accountUser',
     ZKt: {scope}, kgt: () => ({subscribe(handler) {observer = handler; return () => {stopped++;};}})};
@@ -29,6 +34,7 @@ function fixture(options = {}) {
         throw Object.assign(new Error('must not be exposed'), {deliveryUnknown: true});
         return {...msg, ...args}; }
     }, media: {
+      async content(...args) { downloads.push(args); return {blob: new Blob([new Uint8Array([0, 255, 10])]), name: '报告.txt'}; },
       async upload(roomId, file) { uploads.push({roomId, name: file.name, mime: file.type});
         return {fileId: 'uploaded-file', mime: file.type, status: 'UPLOADED'}; },
       async image(...args) { downloads.push(args);
@@ -137,4 +143,23 @@ test('reusing an uploaded image checks the native file in the pinned room withou
   f.changeAccount();
   assert.equal((await bridge.invoke('check_image_file', {file_id: 'CalpicoFile_original'})).error, 'auth_account_changed');
   assert.equal(f.downloads.length, 1); bridge.dispose();
+});
+
+test('native document downloads preserve opaque bytes without exposing URLs', async () => {
+  const f = fixture({fileReply: true});
+  const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
+  const result = await bridge.invoke('download_file', {message_id: 'message', attachment_id: 'document', parent_id: 'parent'});
+  assert.equal(result.ok, true);
+  assert.equal(result.value.file_name, '报告.txt');
+  assert.deepEqual([...Buffer.from(result.value.data_base64, 'base64')], [0, 255, 10]);
+  assert.deepEqual(f.downloads[0].slice(0, 4), ['room', 'message', 'document', 'document']);
+  assert.equal(JSON.stringify(result).includes('private-signed-media'), false);
+  bridge.dispose();
+});
+test('oversized native documents fail before download', async () => {
+  const f = fixture({fileReply: true, large: true});
+  const bridge = await createDesktopRoomBridge(f.shared, f.native, binding);
+  assert.equal((await bridge.invoke('download_file', {message_id: 'message', attachment_id: 'document', parent_id: 'parent'})).error, 'dot_file_too_large');
+  assert.equal(f.downloads.length, 0);
+  bridge.dispose();
 });

@@ -38,7 +38,7 @@ ERROR_CATEGORIES = frozenset({
     'invalid_tts_text', 'tts_library_missing', 'tts_initialization_failed',
     'tts_voice_missing', 'tts_synthesis_failed', 'tts_output_invalid', 'tts_timeout',
     'tts_idempotency_conflict', 'tts_result_unavailable', 'tts_previous_generation_failed',
-    'file_size_mismatch',
+    'file_size_mismatch', 'invalid_file_size', 'invalid_file_name',
 })
 
 
@@ -239,3 +239,14 @@ class CDNHTTPS:
         finally:
             if conn is not None:
                 conn.close()
+
+
+def validate_file(raw, file_name):
+    """Opaque output bytes; never interpret, extract or execute their contents."""
+    if (not isinstance(file_name, str) or not file_name.strip() or
+            len(file_name.encode('utf-8')) > 240 or file_name in ('.', '..') or
+            any(c in '/\\' or ord(c) < 32 or ord(c) == 127 for c in file_name)):
+        raise MediaError('invalid_file_name')
+    if not isinstance(raw, bytes) or not 0 < len(raw) <= MAX_MEDIA:
+        raise MediaError('invalid_file_size')
+    return {'mime_type': 'application/octet-stream', 'sha256': hashlib.sha256(raw).hexdigest()}
