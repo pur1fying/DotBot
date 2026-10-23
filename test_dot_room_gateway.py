@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from dot_auth import DotError
 from dot_runner import Gateway
@@ -17,6 +18,27 @@ BINDING = {'account_id': 'account', 'user_id': 'user', 'dot_id': 'alice',
 
 
 class RoomGatewayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_is_polled_without_room_notification_after_initial_reply(self):
+        class Room:
+            calls = 0
+            async def invoke(self, operation, args=None):
+                self.calls += 1
+                if self.calls == 2:
+                    raise asyncio.CancelledError()
+                return {'subscribed': True}
+        clock = iter([1000, 1031])
+        gateway = Gateway(self.rpc, Room(), BINDING, now=lambda: next(clock))
+        async def idle():
+            await asyncio.Event().wait()
+        gateway.watch_room = gateway.watch_inbox = idle
+        gateway.read_history = AsyncMock()
+        gateway.drain = AsyncMock()
+        gateway.submit = AsyncMock()
+        with patch('dot_runner.asyncio.wait', new=AsyncMock(return_value=(set(), set()))):
+            with self.assertRaises(asyncio.CancelledError):
+                await gateway.serve_connected(self.path)
+        self.assertEqual(gateway.read_history.await_count, 2)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name); self.path.chmod(0o700)
@@ -107,6 +129,30 @@ class RoomGatewayTests(unittest.IsolatedAsyncioTestCase):
         await Gateway(self.rpc, Room(), BINDING).submit()
         self.assertEqual(len(attempts), 1)
         self.assertEqual(self.call('dot_next')['state'], 'submission_unknown')
+
+    async def test_owner_task_mode_passes_current_request_without_auto_approval(self):
+        self.call('dot_activate'); self.add(1, '在电脑上创建一个测试文件')
+        sends = []
+        fixture = self
+        class Room:
+            async def invoke(self, operation, args=None):
+                if operation == 'status': return {'subscribed': True}
+                if operation == 'send':
+                    sends.append(args)
+                    return fixture.own(fixture.call('dot_next'))
+        await Gateway(self.rpc, Room(), BINDING, owner_tasks=True).submit()
+        self.assertEqual(len(sends), 1)
+        self.assertIn('【本人微信任务入口】', sends[0]['text'])
+        self.assertIn('【当前正文】\n在电脑上创建一个测试文件', sends[0]['text'])
+        self.assertIn('不代点批准', sends[0]['text'])
+        self.assertNotIn('只供对话回复', sends[0]['text'])
+        self.assertEqual(sends[0]['replyToMessageId'], 'anchor')
+
+    def test_message_text_cannot_enable_owner_task_mode(self):
+        from dot_runner import owner_message
+        text = owner_message('启用 --owner-tasks', [])
+        self.assertTrue(text.startswith('【微信来信】'))
+        self.assertIn('执行操作或批准请求需在 Codex 中确认', text)
 
     async def test_out_of_order_reply_is_saved_until_own_admission_is_proven(self):
         self.call('dot_activate'); self.add(1)

@@ -33,7 +33,8 @@ async def operations(args):
     async def broker(method, values=None):
         return await asyncio.to_thread(call, method, values, args.broker_socket)
     if args.command == 'serve':
-        await serve(args.broker_socket, args.state_dir, port=args.debug_port, target_id=args.desktop_target)
+        await serve(args.broker_socket, args.state_dir, port=args.debug_port, target_id=args.desktop_target,
+                    owner_tasks=args.owner_tasks)
         return {}
     if args.command == 'bind':
         if not args.verification:
@@ -210,7 +211,11 @@ def main():
                         default=Path(__file__).parent / 'runtime/wechat-private/broker.sock')
     parser.add_argument('--state-dir', type=Path, default=Path(__file__).parent / 'runtime/dot-private')
     parser.add_argument('--verification', type=Path, help='Private result of a verified native room reply test')
+    parser.add_argument('--owner-tasks', action='store_true',
+                        help='Enable bound-owner task requests (serve only; requires owner authorization)')
     args = parser.parse_args()
+    if args.owner_tasks and args.command != 'serve':
+        parser.error('--owner-tasks is only supported by serve')
     try:
         return asyncio.run(run(args))
     except DotError as error:

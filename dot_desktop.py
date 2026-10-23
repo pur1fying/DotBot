@@ -13,14 +13,23 @@ from urllib.parse import parse_qs, urlsplit
 
 from dot_auth import DotError
 
-SHARED_BUNDLE = 'app-shared-9422db8faa3a.js'
-ROOM_BUNDLE = 'app-initial-47b07e923fcc.js'
+SHARED_BUNDLE = 'app-shared-bedb2212942c.js'
+ROOM_BUNDLE = 'app-initial-41d268a90bf8.js'
 
 
 def desktop_targets(port):
     if type(port) is not int or not 1024 <= port <= 65535:
         raise DotError('desktop_invalid_debug_port')
-    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
+    for host in ('127.0.0.1', '::1'):
+        try:
+            return _desktop_targets_at(host, port)
+        except DotError:
+            continue
+    raise DotError('desktop_debug_unavailable')
+
+
+def _desktop_targets_at(host, port):
+    connection = http.client.HTTPConnection(host, port, timeout=2)
     try:
         connection.request('GET', '/json/list')
         response = connection.getresponse()
@@ -49,7 +58,7 @@ def select_target(targets, port, target_id=None):
                 route in ('/avatar-overlay', '/detached-window')):
             continue
         endpoint = urlsplit(target.get('webSocketDebuggerUrl', ''))
-        if (endpoint.scheme != 'ws' or endpoint.hostname != '127.0.0.1' or
+        if (endpoint.scheme != 'ws' or endpoint.hostname not in ('127.0.0.1', '::1') or
                 endpoint.port != port or endpoint.username or endpoint.password or
                 not endpoint.path.startswith('/devtools/page/') or endpoint.query or endpoint.fragment):
             continue
@@ -88,7 +97,10 @@ class DesktopRoomClient:
               if (!entry) throw new Error('desktop_bundle_changed');
               const base = new URL('.', entry);
               const shared = await import(new URL(SHARED_NAME, base).href);
-              const native = await import(new URL(ROOM_NAME, base).href);
+              const installed = await import(new URL(ROOM_NAME, base).href);
+              // Verified exports in this pinned build: QQo initializes the room
+              // dependencies; JQo constructs the native room client.
+              const native = {wN: installed.KN, CN: installed.GN};
               BRIDGE_SOURCE
               return createDesktopRoomBridge(shared, native, BINDING);
             })()'''.replace('SHARED_NAME', json.dumps(SHARED_BUNDLE)).replace(

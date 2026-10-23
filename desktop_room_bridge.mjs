@@ -1,6 +1,6 @@
 // Runs in the existing Codex renderer. All network, auth, integrity preparation,
 // route caching and message projection remain in the installed desktop client.
-// This adapter is pinned to desktop 26.928.21956; a changed bundle must fail closed.
+// dot_desktop.py pins and normalizes the installed bundle exports; unknown builds fail closed.
 export async function createDesktopRoomBridge(shared, native, binding) {
   for (const key of ['account_id', 'user_id', 'dot_id', 'thread_id', 'messaging_room_id']) {
     if (typeof binding[key] !== 'string' || !binding[key] || binding[key].length > 256)

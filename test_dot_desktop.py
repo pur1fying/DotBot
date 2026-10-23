@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 from dot_auth import DotError
-from dot_desktop import DesktopRoomClient, select_target
+from dot_desktop import DesktopRoomClient, select_target, desktop_targets
 
 
 def target(**changes):
@@ -9,6 +10,16 @@ def target(**changes):
 
 
 class DesktopTargetTest(unittest.TestCase):
+    def test_ipv6_loopback_fallback_and_remote_rejection(self):
+        record = target(webSocketDebuggerUrl='ws://[::1]:9229/devtools/page/main')
+        self.assertEqual(select_target([record], 9229)['id'], 'main')
+        with patch('dot_desktop._desktop_targets_at', side_effect=[
+                DotError('desktop_debug_unavailable'), [record]]) as read:
+            self.assertEqual(desktop_targets(9229), [record])
+            self.assertEqual([c.args for c in read.call_args_list], [('127.0.0.1', 9229), ('::1', 9229)])
+        with self.assertRaises(DotError):
+            select_target([target(webSocketDebuggerUrl='ws://[2001:db8::1]:9229/devtools/page/main')], 9229)
+
     def test_ignores_webpages_and_refuses_remote_or_ambiguous_target(self):
         self.assertEqual(select_target([target(url='https://chatgpt.com/'), target()], 9229)['id'], 'main')
         for records in ([target(), target(id='second')],

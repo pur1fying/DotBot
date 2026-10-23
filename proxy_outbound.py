@@ -8,6 +8,7 @@ boundary. No proxy authentication or platform credentials are accepted here.
 import http.client
 import ipaddress
 import json
+import os
 import socket
 import ssl
 import threading
@@ -18,7 +19,9 @@ from outbound import CallbackError, SafeHTTPS
 CALLBACK_HOST = "connectors.api.openai.com"
 DOH_HOST = "cloudflare-dns.com"
 DOH_BOOTSTRAP = "1.1.1.1"
-PROXY = ("127.0.0.1", 7890)
+PROXY = ("127.0.0.1", int(os.environ.get('DOTBOT_PROXY_PORT', '7890')))
+if not 1024 <= PROXY[1] <= 65535:
+    raise ValueError('invalid DOTBOT_PROXY_PORT')
 MAX_CACHE_TTL = 300
 
 
